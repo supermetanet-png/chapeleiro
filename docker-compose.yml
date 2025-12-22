@@ -1,0 +1,81 @@
+
+services:
+  nginx:
+    image: nginx:alpine
+    # Mapeamento de portas dinâmico.
+    # VPS/Standalone: Usa 80:80 e 443:443 (Definido no .env)
+    # EasyPanel/PaaS: Se der conflito, altere APP_HTTP_PORT no .env para 3005
+    ports:
+      - "${APP_HTTP_PORT:-80}:80"
+      - "${APP_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - acme_challenge:/var/www/html/.well-known/acme-challenge
+      - certs:/etc/letsencrypt
+    depends_on:
+      - backend_control
+      - backend_data
+      - frontend
+    restart: always
+
+  backend_control:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - SERVICE_MODE=CONTROL_PLANE
+      - SYSTEM_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
+      - SYSTEM_JWT_SECRET=${SYSTEM_JWT_SECRET}
+      - PORT=3000
+    volumes:
+      - acme_challenge:/var/www/html/.well-known/acme-challenge
+      - certs:/etc/letsencrypt
+      - storage_data:/app/../storage
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+
+  backend_data:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - SERVICE_MODE=DATA_PLANE
+      - SYSTEM_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
+      - SYSTEM_JWT_SECRET=${SYSTEM_JWT_SECRET}
+      - PORT=3000
+    volumes:
+      - storage_data:/app/../storage
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: always
+
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-cascata_admin}
+      POSTGRES_PASSWORD: ${DB_PASS:-secure_pass}
+      POSTGRES_DB: ${DB_NAME:-cascata_system}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-cascata_admin} -d ${DB_NAME:-cascata_system}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  acme_challenge:
+  certs:
+  storage_data:

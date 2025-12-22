@@ -1,0 +1,98 @@
+
+server {
+    listen 80;
+    server_name _;
+    
+    # Aumentar tamanho máximo de upload
+    client_max_body_size 100M;
+
+    # Rota de Desafio do Certbot (Let's Encrypt)
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        allow all;
+    }
+
+    # Frontend Management Studio
+    location / {
+        proxy_pass http://frontend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Control Plane API
+    location /api/control/ {
+        proxy_pass http://backend_control:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Data Plane API
+    location /api/data/ {
+        proxy_pass http://backend_data:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    
+    # Short URLs
+    location ~ ^/(rpc|tables|auth|storage|realtime)/ {
+        proxy_pass http://backend_data:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# BLOCO SSL SEGURO (HTTPS)
+server {
+    listen 443 ssl;
+    server_name _;
+    client_max_body_size 100M;
+
+    # Certificados Padronizados do Sistema
+    # O backend garante que estes arquivos sempre existem (mesmo que dummy na inicialização)
+    ssl_certificate /etc/letsencrypt/live/system/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/system/privkey.pem;
+
+    # Configurações Modernas de Segurança (Compatível com Cloudflare Full SSL)
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    location / {
+        proxy_pass http://frontend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/control/ {
+        proxy_pass http://backend_control:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/data/ {
+        proxy_pass http://backend_data:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    
+    location ~ ^/(rpc|tables|auth|storage|realtime)/ {
+        proxy_pass http://backend_data:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
