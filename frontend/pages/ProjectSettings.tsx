@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { 
   Shield, Key, Globe, Lock, Save, Loader2, CheckCircle2, Copy, 
@@ -8,6 +9,8 @@ import {
 const ProjectSettings: React.FC<{ projectId: string }> = ({ projectId }) => {
   const [project, setProject] = useState<any>(null);
   const [customDomain, setCustomDomain] = useState('');
+  const [sslSource, setSslSource] = useState('');
+  const [availableCerts, setAvailableCerts] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [rotating, setRotating] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -25,10 +28,20 @@ const ProjectSettings: React.FC<{ projectId: string }> = ({ projectId }) => {
     const current = data.find((p: any) => p.slug === projectId);
     setProject(current);
     setCustomDomain(current?.custom_domain || '');
+    setSslSource(current?.ssl_certificate_source || '');
     
     const rawOrigins = current?.metadata?.allowed_origins || [];
     setOrigins(rawOrigins.map((o: any) => typeof o === 'string' ? { url: o, require_auth: true } : o));
     
+    // Fetch available certificates for linking
+    try {
+        const certRes = await fetch('/api/control/system/certificates/status', {
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
+        });
+        const certData = await certRes.json();
+        setAvailableCerts(certData.domains || []);
+    } catch(e) { console.error("Cert list failed"); }
+
     setLoading(false);
   };
 
@@ -46,7 +59,7 @@ const ProjectSettings: React.FC<{ projectId: string }> = ({ projectId }) => {
   const handleUpdateSettings = async (overrideOrigins?: any[]) => {
     setSaving(true);
     try {
-      const payload: any = { custom_domain: customDomain };
+      const payload: any = { custom_domain: customDomain, ssl_certificate_source: sslSource || null };
       if (overrideOrigins) payload.metadata = { allowed_origins: overrideOrigins };
 
       const res = await fetch(`/api/control/projects/${projectId}`, {
@@ -159,6 +172,21 @@ const { data } = await cascata.from('users').select();
                   className="w-full bg-slate-50 border border-slate-100 rounded-2xl py-4 px-6 text-sm font-bold text-slate-900 outline-none focus:ring-4 focus:ring-indigo-500/10 transition-all" 
                 />
                 <p className="text-[10px] text-slate-400 font-medium px-2">Aponte o CNAME/A do seu domínio para <b>{window.location.hostname}</b> para ativar o isolamento.</p>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Linked Certificate (Shared SSL)</label>
+                <select 
+                  value={sslSource} 
+                  onChange={(e) => setSslSource(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-100 rounded-2xl py-4 px-6 text-sm font-bold text-slate-900 outline-none focus:ring-4 focus:ring-indigo-500/10 transition-all cursor-pointer"
+                >
+                    <option value="">Use Certificate for {customDomain || 'this domain'}</option>
+                    {availableCerts.map(cert => (
+                        <option key={cert} value={cert}>Use existing cert from: {cert}</option>
+                    ))}
+                </select>
+                <p className="text-[10px] text-slate-400 font-medium px-2">Útil se você tem um certificado Wildcard (*.site.com) instalado em outro domínio.</p>
               </div>
 
               <div className="p-6 bg-slate-50 rounded-2xl border border-slate-100 space-y-4">

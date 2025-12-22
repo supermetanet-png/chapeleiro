@@ -41,11 +41,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const STORAGE_ROOT = path.resolve(__dirname, '../storage');
 const MIGRATIONS_ROOT = path.resolve(__dirname, '../migrations');
+const NGINX_DYNAMIC_ROOT = '/etc/nginx/conf.d/dynamic';
 
 // Ensure directories exist immediately
 try {
   if (!fs.existsSync(STORAGE_ROOT)) fs.mkdirSync(STORAGE_ROOT, { recursive: true });
-} catch (e) { console.error('[System] Storage root create error:', e); }
+  if (!fs.existsSync(NGINX_DYNAMIC_ROOT)) fs.mkdirSync(NGINX_DYNAMIC_ROOT, { recursive: true });
+} catch (e) { console.error('[System] Root dir create error:', e); }
 
 const upload = multer({ dest: path.join(__dirname, '../uploads') });
 const generateKey = () => crypto.randomBytes(32).toString('hex');
@@ -57,7 +59,7 @@ const systemPool = new Pool({
   idleTimeoutMillis: 30000 
 });
 
-// --- INTEGRATED CERTIFICATE MANAGER (Updated for System Sync) ---
+// --- INTEGRATED CERTIFICATE MANAGER (Updated for SNI & Sync) ---
 export type CertProvider = 'traefik' | 'certbot' | 'manual' | 'none';
 
 class CertificateManager {
@@ -65,8 +67,9 @@ class CertificateManager {
   private static systemCertPath = '/etc/letsencrypt/live/system';
   private static webrootPath = '/var/www/html';
 
+  // Validação melhorada para aceitar subdomínios de 1 caractere e TLDs compostos
   private static validateDomain(domain: string): boolean {
-    const regex = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+$/;
+    const regex = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
     return regex.test(domain) && !domain.includes('..');
   }
 
@@ -82,7 +85,6 @@ class CertificateManager {
 
         if (!fs.existsSync(certFile) || !fs.existsSync(keyFile)) {
             console.log('[CertManager] Generating fallback self-signed certificate for Nginx startup...');
-            // Gera um certificado auto-assinado válido por 10 anos apenas para segurar o Nginx em pé
             execSync(`openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout ${keyFile} -out ${certFile} -subj "/C=US/ST=State/L=City/O=Cascata/CN=localhost"`, { stdio: 'ignore' });
             console.log('[CertManager] Fallback certificate created.');
         }
@@ -91,12 +93,11 @@ class CertificateManager {
     }
   }
 
-  // Copia o certificado gerado para a pasta "system" que o Nginx lê
+  // Copia o certificado gerado para a pasta "system" (SOMENTE para o domínio principal)
   private static syncToSystem(sourceDir: string) {
       try {
           if (!fs.existsSync(this.systemCertPath)) fs.mkdirSync(this.systemCertPath, { recursive: true });
           
-          // Lida com symlinks do certbot resolvendo o caminho real
           const realCertPath = fs.realpathSync(path.join(sourceDir, 'fullchain.pem'));
           const realKeyPath = fs.realpathSync(path.join(sourceDir, 'privkey.pem'));
 
@@ -107,6 +108,63 @@ class CertificateManager {
           console.error('[CertManager] Sync failed:', e);
           throw new Error("Falha ao aplicar certificado no sistema. Verifique logs.");
       }
+  }
+
+  // Gera arquivos de configuração do Nginx para cada projeto
+  public static async rebuildNginxConfigs() {
+    console.log('[CertManager] Rebuilding Nginx dynamic configurations...');
+    try {
+      if (!fs.existsSync(NGINX_DYNAMIC_ROOT)) fs.mkdirSync(NGINX_DYNAMIC_ROOT, { recursive: true });
+
+      // Limpa configs antigas
+      const oldFiles = fs.readdirSync(NGINX_DYNAMIC_ROOT);
+      for (const file of oldFiles) {
+        if (file.endsWith('.conf')) fs.unlinkSync(path.join(NGINX_DYNAMIC_ROOT, file));
+      }
+
+      const result = await systemPool.query('SELECT slug, custom_domain, ssl_certificate_source FROM system.projects WHERE custom_domain IS NOT NULL');
+      
+      let generatedCount = 0;
+      for (const proj of result.rows) {
+        if (!proj.custom_domain) continue;
+
+        // Determina qual certificado usar (Próprio ou Compartilhado/Linkado)
+        const certDomain = proj.ssl_certificate_source || proj.custom_domain;
+        const certPath = path.join(this.basePath, certDomain);
+        
+        // Verifica se os arquivos de certificado realmente existem
+        if (fs.existsSync(path.join(certPath, 'fullchain.pem')) && fs.existsSync(path.join(certPath, 'privkey.pem'))) {
+          const configContent = `
+server {
+    listen 443 ssl;
+    server_name ${proj.custom_domain};
+    
+    ssl_certificate /etc/letsencrypt/live/${certDomain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${certDomain}/privkey.pem;
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    
+    client_max_body_size 100M;
+
+    location / {
+        proxy_pass http://backend_data:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}`;
+          fs.writeFileSync(path.join(NGINX_DYNAMIC_ROOT, `${proj.slug}.conf`), configContent.trim());
+          generatedCount++;
+        } else {
+          console.warn(`[CertManager] Skipping config for ${proj.custom_domain}: Certificate for ${certDomain} not found.`);
+        }
+      }
+      console.log(`[CertManager] Generated ${generatedCount} config files. Nginx reload required.`);
+    } catch (e) {
+      console.error('[CertManager] Failed to rebuild configs:', e);
+    }
   }
 
   public static async detectEnvironment(): Promise<any> {
@@ -133,10 +191,18 @@ class CertificateManager {
     };
   }
 
-  public static async requestCertificate(domain: string, email: string, provider: CertProvider, manualData?: { cert: string, key: string }): Promise<{ success: boolean, message: string }> {
-    if (!this.validateDomain(domain)) throw new Error("Domínio inseguro.");
+  public static async requestCertificate(domain: string, email: string, provider: CertProvider, manualData?: { cert: string, key: string }, isSystem: boolean = false): Promise<{ success: boolean, message: string }> {
+    if (!this.validateDomain(domain)) throw new Error("Domínio inseguro ou inválido.");
 
     const domainDir = path.join(this.basePath, domain);
+
+    const finishSetup = async () => {
+      if (isSystem) {
+        this.syncToSystem(domainDir);
+      }
+      // Sempre reconstrói as configs do Nginx para garantir que novos domínios ou renovações sejam aplicados
+      await this.rebuildNginxConfigs();
+    };
 
     if (provider === 'manual' || provider === 'cloudflare_pem' as any) {
         if (!manualData?.cert || !manualData?.key) throw new Error("Cert/Key required.");
@@ -147,8 +213,8 @@ class CertificateManager {
         fs.writeFileSync(path.join(domainDir, 'fullchain.pem'), manualData.cert.trim());
         fs.writeFileSync(path.join(domainDir, 'privkey.pem'), manualData.key.trim());
         
-        this.syncToSystem(domainDir);
-        return { success: true, message: "Certificados manuais instalados. Reinicie o container Nginx (docker restart cascata-nginx-1) para aplicar." };
+        await finishSetup();
+        return { success: true, message: "Certificados manuais instalados. Reinicie o container Nginx para aplicar." };
     }
 
     if (provider === 'certbot' || provider === 'letsencrypt' as any) {
@@ -166,13 +232,13 @@ class CertificateManager {
             certbot.stdout.on('data', d => log += d.toString());
             certbot.stderr.on('data', d => log += d.toString());
             
-            certbot.on('close', (code) => {
+            certbot.on('close', async (code) => {
                 if (code === 0) {
                     try {
-                        this.syncToSystem(domainDir);
-                        resolve({ success: true, message: "Certificado gerado e aplicado! Reinicie o container Nginx (docker restart cascata-nginx-1) para carregar o novo HTTPS." });
+                        await finishSetup();
+                        resolve({ success: true, message: "Certificado gerado com sucesso! Reinicie o container Nginx para carregar." });
                     } catch (e: any) {
-                        reject(new Error(`Certbot OK, mas falha na sincronização: ${e.message}`));
+                        reject(new Error(`Certbot OK, mas falha na pós-configuração: ${e.message}`));
                     }
                 }
                 else reject(new Error(`Falha no Certbot (Code ${code}): ${log.slice(-300)}`));
@@ -241,6 +307,10 @@ class MigrationRunner {
           }
         }
       }
+      
+      // Rebuild Nginx Configs after migrations (to sync old projects)
+      await CertificateManager.rebuildNginxConfigs();
+
     } catch (e: any) {
       console.error('[MigrationRunner] Error:', e.message);
     } finally {
@@ -319,7 +389,6 @@ const queryWithRLS = async (req: CascataRequest, callback: (client: pg.PoolClien
   }
 };
 
-// ... (Rest of utils like parseBytes, getSectorForExt remain same - omitted for brevity, assumed unchanged) ...
 const parseBytes = (sizeStr: string): number => {
   if (!sizeStr) return 10 * 1024 * 1024; 
   const match = sizeStr.toString().match(/^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?$/);
@@ -355,7 +424,7 @@ const getSectorForExt = (ext: string): string => {
 
 // --- 4. MIDDLEWARES CORE ---
 
-// Control Plane Firewall (Fault Tolerant)
+// Control Plane Firewall
 const controlPlaneFirewall: RequestHandler = async (req: any, res: any, next: any) => {
   if (req.method !== 'OPTIONS' && req.path.startsWith('/api/control/projects/')) {
     const slug = req.path.split('/')[4]; 
@@ -380,7 +449,7 @@ const controlPlaneFirewall: RequestHandler = async (req: any, res: any, next: an
                 }
             }
         } catch (e) {
-            // Fail open to avoid blocking valid traffic if DB is glitchy
+            // Fail open if DB issue
         }
     }
   }
@@ -390,7 +459,7 @@ const controlPlaneFirewall: RequestHandler = async (req: any, res: any, next: an
 // A. Project Resolver & Domain Locking
 const resolveProject: RequestHandler = async (req: any, res: any, next: any) => {
   if (req.path.startsWith('/api/control/')) return next();
-  if (req.path === '/' || req.path === '/health') return next(); // Skip for health check
+  if (req.path === '/' || req.path === '/health') return next(); 
   
   const r = req as CascataRequest;
   const host = req.headers.host || '';
@@ -497,7 +566,6 @@ const cascataAuth: RequestHandler = async (req: any, res: any, next: any) => {
   }
 
   if (!r.project) { 
-      // If we are at root, no project context is fine
       if (req.path === '/' || req.path === '/health') return next();
       res.status(404).json({ error: 'No Project Context' }); 
       return; 
@@ -553,7 +621,7 @@ const detectSemanticAction = (method: string, path: string): string | null => {
     return null;
 };
 
-// C. Audit Logger (Enhanced)
+// C. Audit Logger
 const auditLogger: RequestHandler = (req: any, res: any, next: any) => {
   const start = Date.now();
   const oldJson = res.json;
@@ -813,17 +881,20 @@ app.delete('/api/control/projects/:slug', async (req: any, res: any) => {
     if (fs.existsSync(storagePath)) {
         fs.rmSync(storagePath, { recursive: true, force: true });
     }
+    
+    // Rebuild Nginx configs to remove deleted project
+    await CertificateManager.rebuildNginxConfigs();
 
     res.json({ success: true });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.patch('/api/control/projects/:slug', async (req: any, res: any) => {
-  const { custom_domain, log_retention_days, metadata } = req.body;
+  const { custom_domain, log_retention_days, metadata, ssl_certificate_source } = req.body;
   try {
     let metadataQueryPart = 'metadata'; 
-    const params = [custom_domain, log_retention_days, req.params.slug];
-    let paramIdx = 4;
+    const params = [custom_domain, log_retention_days, req.params.slug, ssl_certificate_source];
+    let paramIdx = 5;
 
     if (metadata) {
         metadataQueryPart = `COALESCE(metadata, '{}'::jsonb) || $${paramIdx}::jsonb`;
@@ -834,11 +905,16 @@ app.patch('/api/control/projects/:slug', async (req: any, res: any) => {
       `UPDATE system.projects 
        SET custom_domain = COALESCE($1, custom_domain), 
            log_retention_days = COALESCE($2, log_retention_days),
+           ssl_certificate_source = COALESCE($4, ssl_certificate_source),
            metadata = ${metadataQueryPart},
            updated_at = now() 
        WHERE slug = $3 RETURNING *`,
       params
     );
+    
+    // Update Nginx configs dynamically
+    await CertificateManager.rebuildNginxConfigs();
+    
     res.json(result.rows[0]);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -928,20 +1004,20 @@ app.get('/api/control/system/certificates/status', async (req: any, res: any) =>
 });
 
 app.post('/api/control/system/certificates', async (req: any, res: any) => {
-  const { domain, email, cert, key, provider } = req.body;
+  const { domain, email, cert, key, provider, isSystem } = req.body;
   try {
     const result = await CertificateManager.requestCertificate(
         domain, 
         email, 
         provider, 
-        { cert, key }
+        { cert, key },
+        isSystem
     );
     res.json(result);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-// ... (Rest of Data Plane routes remains unchanged) ...
-// --- DATA PLANE ---
+// --- DATA PLANE ROUTES ---
 
 app.get('/api/data/:slug/stats', async (req: any, res: any) => {
   const r = req as CascataRequest;

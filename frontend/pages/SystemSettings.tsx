@@ -162,7 +162,8 @@ const SystemSettings: React.FC = () => {
           cert: certPem, 
           key: keyPem, 
           provider: sslMode,
-          email: leEmail
+          email: leEmail,
+          isSystem: true // MARCADOR CRÍTICO: Indica que é o certificado root do sistema
         })
       });
       if (!response.ok) throw new Error('Erro na comunicação com o Control Plane.');
