@@ -5,8 +5,9 @@ WORKDIR /app
 # Contexto agora é ./backend
 COPY package*.json ./
 
-# Adiciona docker-cli para permitir reload do nginx e openssl/certbot para SSL
-RUN apk add --no-cache certbot openssl docker-cli
+# Adiciona docker-cli e docker-compose (standalone) para orquestração
+# Adiciona openssl e certbot para gestão de SSL
+RUN apk add --no-cache certbot openssl docker-cli docker-compose
 RUN npm install
 
 # Copia arquivos do backend

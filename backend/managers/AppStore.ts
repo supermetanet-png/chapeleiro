@@ -23,9 +23,8 @@ export class AppStore {
         if (!fs.existsSync(APPS_ROOT)) fs.mkdirSync(APPS_ROOT, { recursive: true });
     }
 
-    // --- 1. LISTAGEM (ONLINE ONLY - SECURITY ENFORCED) ---
+    // --- 1. LISTAGEM (ONLINE ONLY) ---
     public async fetchStoreListing() {
-        // Removido fallback local inseguro. Se não conectar, falha explicitamente.
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 8000);
         
@@ -42,7 +41,7 @@ export class AppStore {
         }
     }
 
-    // --- 2. INSTALAÇÃO (VALIDATED) ---
+    // --- 2. INSTALAÇÃO (ROBUST DEPLOY) ---
     public async installApp(projectSlug: string, appId: string, domain: string) {
         // 1. Validação de Duplicidade de Domínio
         const cleanDomain = domain.trim().toLowerCase();
@@ -69,7 +68,7 @@ export class AppStore {
         const deployId = crypto.randomUUID();
         const shortId = deployId.split('-')[0];
         
-        // Configuração de Banco de Dados
+        // Configuração de Banco de Dados Isolado
         const dbName = `app_${projectSlug.replace(/-/g,'_')}_${appId}_${shortId}`.toLowerCase();
         const dbUser = `u_${shortId}`;
         const dbPass = crypto.randomBytes(16).toString('hex');
@@ -79,7 +78,7 @@ export class AppStore {
         const runnerSecret = crypto.randomBytes(32).toString('base64');
         const jwtSecret = crypto.randomBytes(32).toString('hex');
 
-        // A. Provisionar Banco de Dados
+        // A. Provisionar Banco de Dados no Postgres do Sistema
         const client = await this.systemPool.connect();
         try {
             const userCheck = await client.query(`SELECT 1 FROM pg_roles WHERE rolname=$1`, [dbUser]);
@@ -94,7 +93,7 @@ export class AppStore {
             client.release();
         }
 
-        // B. Obter Template Docker Compose (ONLINE ONLY)
+        // B. Obter Template Docker Compose
         let composeTemplate = '';
         try {
             const res = await fetch(`${GITHUB_REPO_BASE}/${appId}/docker-compose.yml`);
@@ -107,7 +106,7 @@ export class AppStore {
             throw new Error(`Erro ao baixar template: ${e.message}`);
         }
 
-        // C. Substituir Variáveis
+        // C. Substituir Variáveis no Template
         const networkName = await this.getDockerNetworkName();
         const containerPrefix = `app-${shortId}`;
         
@@ -123,7 +122,7 @@ export class AppStore {
             .replace(/\${JWT_SECRET}/g, jwtSecret)
             .replace(/\${RUNNER_SECRET}/g, runnerSecret);
 
-        // D. Salvar Arquivos
+        // D. Salvar Arquivo
         const appDir = path.join(APPS_ROOT, deployId);
         if (!fs.existsSync(appDir)) fs.mkdirSync(appDir, { recursive: true });
         fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), finalCompose);
@@ -143,15 +142,16 @@ export class AppStore {
             [deployId, projectSlug, appId, cleanDomain, 5678, `${containerPrefix}-main`, JSON.stringify(envVars)]
         );
 
-        // F. Executar Deploy
+        // F. Executar Deploy (FIX: Usando docker-compose com hífen para Alpine)
         try {
-            await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} up -d`);
+            await execAsync(`docker-compose -f ${path.join(appDir, 'docker-compose.yml')} up -d`);
             await this.systemPool.query(`UPDATE system.apps SET status = 'running' WHERE id = $1`, [deployId]);
             return { success: true, id: deployId };
         } catch (e: any) {
             console.error("[AppStore] Docker Deploy Failed:", e);
             await this.systemPool.query(`UPDATE system.apps SET status = 'error' WHERE id = $1`, [deployId]);
-            throw new Error(`Deploy Docker falhou: ${e.message}`);
+            // Não deletamos o registro para permitir debug, o usuário pode deletar pela UI
+            throw new Error(`Comando Docker falhou. Verifique se a imagem existe e se o template é válido. Detalhes: ${e.message}`);
         }
     }
 
@@ -159,7 +159,7 @@ export class AppStore {
         const appDir = path.join(APPS_ROOT, appId);
         if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
             try {
-                await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} down`);
+                await execAsync(`docker-compose -f ${path.join(appDir, 'docker-compose.yml')} down`);
             } catch (e) {
                 console.warn(`[AppStore] Warning on stop: ${e}`);
             }
@@ -170,22 +170,22 @@ export class AppStore {
     public async startApp(appId: string) {
         const appDir = path.join(APPS_ROOT, appId);
         if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
-            await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} up -d`);
+            await execAsync(`docker-compose -f ${path.join(appDir, 'docker-compose.yml')} up -d`);
         } else {
             throw new Error("Arquivos da aplicação não encontrados.");
         }
         await this.systemPool.query(`UPDATE system.apps SET status = 'running' WHERE id = $1`, [appId]);
     }
 
-    // --- ROBUST DELETE (FIXES 500 ERROR) ---
+    // --- ROBUST DELETE (PREVINE ERRO 500) ---
     public async deleteApp(appId: string) {
         console.log(`[AppStore] Deleting app ${appId}...`);
         const appDir = path.join(APPS_ROOT, appId);
         
-        // 1. Tentar derrubar containers (ignora erro se já não existirem)
+        // 1. Tentar derrubar containers (ignora erro se já não existirem ou docker falhar)
         if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
             try {
-                await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} down -v`);
+                await execAsync(`docker-compose -f ${path.join(appDir, 'docker-compose.yml')} down -v`);
             } catch (e: any) {
                 console.warn(`[AppStore] Docker down failed (ignoring cleanup): ${e.message}`);
             }
@@ -205,7 +205,7 @@ export class AppStore {
             console.warn(`[AppStore] DB Cleanup failed:`, e);
         }
 
-        // 3. Remover registro do banco (CRÍTICO: Isso previne o erro 500 de persistir)
+        // 3. Remover registro do banco (CRÍTICO: Isso previne o erro 500 de persistir na UI)
         await this.systemPool.query(`DELETE FROM system.apps WHERE id = $1`, [appId]);
         
         // 4. Remover arquivos
@@ -223,6 +223,7 @@ export class AppStore {
         if (res.rows.length === 0) throw new Error("App not found");
         const container = res.rows[0].container_name_main;
         try {
+            // Logs usa docker CLI normal
             const { stdout } = await execAsync(`docker logs --tail ${lines} ${container}`);
             return stdout;
         } catch (e) {
@@ -232,6 +233,7 @@ export class AppStore {
 
     private async getDockerNetworkName(): Promise<string> {
         try {
+            // Tenta descobrir a rede do Nginx automaticamente
             const containerName = process.env.NGINX_CONTAINER_NAME || 'cascata-nginx';
             const { stdout } = await execAsync(`docker inspect ${containerName} --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}'`);
             return stdout.trim() || 'bridge';

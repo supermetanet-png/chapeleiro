@@ -3,7 +3,8 @@ import React, { useState, useEffect } from 'react';
 import { 
   AppWindow, Plus, Play, Square, Trash2, ExternalLink, 
   Terminal, Globe, Loader2, CheckCircle2, AlertCircle, 
-  Settings, X, CloudLightning, Download, ShoppingBag, Server, AlertTriangle
+  Settings, X, CloudLightning, Download, ShoppingBag, Server, AlertTriangle,
+  Lock, Globe2, Link, ShieldCheck
 } from 'lucide-react';
 
 const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
@@ -23,18 +24,33 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
   
   // INSTALLATION STATE
   const [installModal, setInstallModal] = useState<any>(null);
+  const [installStep, setInstallStep] = useState<'config' | 'deploying' | 'success'>('config');
+  const [installing, setInstalling] = useState(false);
+  const [availableCerts, setAvailableCerts] = useState<string[]>([]);
+
+  // Domain Config Form
+  const [domainMode, setDomainMode] = useState<'subdomain' | 'custom'>('custom');
+  const [customDomain, setCustomDomain] = useState('');
   const [subdomain, setSubdomain] = useState('');
   const [systemDomain, setSystemDomain] = useState('');
-  const [installing, setInstalling] = useState(false);
+  
+  // SSL Config Form
+  const [sslMode, setSslMode] = useState<'none' | 'letsencrypt' | 'existing'>('none');
+  const [adminEmail, setAdminEmail] = useState('');
 
   // FETCHERS
   const fetchSystemConfig = async () => {
       try {
-          const res = await fetch('/api/control/system/settings', {
-              headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
-          });
-          const data = await res.json();
-          if (data.domain) setSystemDomain(data.domain);
+          const [settingsRes, certsRes] = await Promise.all([
+            fetch('/api/control/system/settings', { headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` } }),
+            fetch('/api/control/system/certificates/status', { headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` } })
+          ]);
+          
+          const settings = await settingsRes.json();
+          const certs = await certsRes.json();
+          
+          if (settings.domain) setSystemDomain(settings.domain);
+          if (certs.domains) setAvailableCerts(certs.domains);
       } catch (e) { console.error("Falha ao carregar config do sistema"); }
   };
 
@@ -72,17 +88,24 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
 
   // ACTIONS
   const handleInstall = async () => {
-    // Constrói o domínio final
-    const finalDomain = systemDomain ? `${subdomain}.${systemDomain}` : subdomain;
-    
-    if (!finalDomain) {
-        alert("Domínio inválido.");
-        return;
+    // 1. Determine Final Domain
+    let finalDomain = '';
+    if (domainMode === 'subdomain') {
+        if (!subdomain || !systemDomain) { alert("Configuração de subdomínio inválida. Verifique se o sistema tem um domínio base."); return; }
+        finalDomain = `${subdomain}.${systemDomain}`;
+    } else {
+        if (!customDomain) { alert("Domínio customizado obrigatório."); return; }
+        finalDomain = customDomain;
     }
 
+    if (!finalDomain) return;
+
     setInstalling(true);
+    setInstallStep('deploying');
+
     try {
-      const res = await fetch(`/api/control/projects/${projectId}/apps/install`, {
+      // 2. Install App Logic
+      const installRes = await fetch(`/api/control/projects/${projectId}/apps/install`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -94,17 +117,36 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
         })
       });
       
-      if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.error || "Erro na instalação");
+      if (!installRes.ok) {
+          const errData = await installRes.json();
+          throw new Error(errData.error || "Erro na instalação do container");
       }
 
-      setInstallModal(null);
-      setSubdomain('');
-      setActiveTab('installed');
-      fetchInstalledApps(); // Refresh imediato
+      // 3. SSL Handling (Se selecionado)
+      if (sslMode === 'letsencrypt') {
+          if (!adminEmail) throw new Error("Email obrigatório para Let's Encrypt");
+          
+          await fetch('/api/control/system/certificates', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${localStorage.getItem('cascata_token')}`
+            },
+            body: JSON.stringify({ 
+              domain: finalDomain, 
+              provider: 'letsencrypt',
+              email: adminEmail,
+              isSystem: false
+            })
+          });
+      } 
+      // Se "existing", o backend já usa o certificado se o arquivo existir no volume
+
+      setInstallStep('success');
+      fetchInstalledApps();
     } catch (e: any) {
-      alert(`Falha no deploy: ${e.message}`);
+      alert(`Falha crítica: ${e.message}`);
+      setInstallStep('config');
     } finally {
       setInstalling(false);
     }
@@ -143,6 +185,14 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
         setLogs(data.logs);
     } catch(e) {}
     finally { setLoadingLogs(false); }
+  };
+
+  const resetInstallModal = () => {
+      setInstallModal(null);
+      setInstallStep('config');
+      setSubdomain('');
+      setCustomDomain('');
+      setSslMode('none');
   };
 
   return (
@@ -237,7 +287,7 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
                         </div>
 
                         <button 
-                            onClick={() => { setInstallModal(item); setSubdomain(item.id); }}
+                            onClick={() => { setInstallModal(item); setSubdomain(item.id); setInstallStep('config'); }}
                             className="w-full bg-slate-900 text-white py-4 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-indigo-600 transition-all shadow-xl group-hover:shadow-indigo-200 flex items-center justify-center gap-2"
                         >
                             <Download size={14}/> Instalar
@@ -248,55 +298,118 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
           )
       )}
 
-      {/* INSTALL MODAL */}
+      {/* ADVANCED INSTALL MODAL */}
       {installModal && (
         <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-[500] flex items-center justify-center p-8 animate-in zoom-in-95">
-           <div className="bg-white rounded-[3rem] w-full max-w-lg p-12 shadow-2xl border border-slate-200 relative">
-              <h3 className="text-3xl font-black text-slate-900 tracking-tighter mb-2">Deploy {installModal.name}</h3>
-              <p className="text-slate-500 text-sm font-medium mb-8">Configuração automática de Banco de Dados, Redis e Domínio.</p>
+           <div className="bg-white rounded-[3rem] w-full max-w-2xl p-12 shadow-2xl border border-slate-200 relative overflow-hidden">
               
-              <div className="space-y-6">
-                 <div className="space-y-2">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">URL da Aplicação</label>
+              {installStep === 'config' && (
+                  <>
+                    <h3 className="text-3xl font-black text-slate-900 tracking-tighter mb-2">Deploy {installModal.name}</h3>
+                    <p className="text-slate-500 text-sm font-medium mb-8">Configure o ponto de entrada da sua aplicação.</p>
                     
-                    {systemDomain ? (
-                        // MODO FÁCIL: Subdomínio
-                        <div className="flex items-center bg-slate-50 border border-slate-200 rounded-2xl overflow-hidden focus-within:ring-4 focus-within:ring-indigo-500/10">
-                            <input 
-                                autoFocus
-                                value={subdomain}
-                                onChange={(e) => setSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
-                                placeholder="app-name"
-                                className="flex-1 bg-transparent py-4 pl-6 text-lg font-bold text-slate-900 outline-none text-right"
-                            />
-                            <div className="bg-slate-100 py-4 pr-6 pl-2 text-slate-500 font-bold text-sm border-l border-slate-200">
-                                .{systemDomain}
+                    <div className="space-y-8">
+                        {/* 1. DOMAIN SELECTOR */}
+                        <div className="space-y-3">
+                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Estratégia de Domínio</label>
+                            <div className="flex gap-4">
+                                <button onClick={() => setDomainMode('custom')} className={`flex-1 py-4 rounded-2xl border text-xs font-black uppercase tracking-widest transition-all ${domainMode === 'custom' ? 'bg-indigo-600 text-white border-indigo-600 shadow-xl' : 'bg-white border-slate-200 text-slate-400 hover:bg-slate-50'}`}>
+                                    Domínio Próprio (FQDN)
+                                </button>
+                                <button onClick={() => setDomainMode('subdomain')} disabled={!systemDomain} className={`flex-1 py-4 rounded-2xl border text-xs font-black uppercase tracking-widest transition-all ${domainMode === 'subdomain' ? 'bg-indigo-600 text-white border-indigo-600 shadow-xl' : 'bg-white border-slate-200 text-slate-400 hover:bg-slate-50 disabled:opacity-50'}`}>
+                                    Subdomínio Cascata
+                                </button>
                             </div>
-                        </div>
-                    ) : (
-                        // MODO MANUAL: Domínio completo (Fallback)
-                        <input 
-                            autoFocus
-                            value={subdomain}
-                            onChange={(e) => setSubdomain(e.target.value)}
-                            placeholder="app.meudominio.com"
-                            className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 px-6 text-lg font-bold text-slate-900 outline-none focus:ring-4 focus:ring-indigo-500/10"
-                        />
-                    )}
 
-                    {!systemDomain && (
-                        <div className="flex gap-2 items-center text-amber-600 bg-amber-50 p-3 rounded-xl mt-2">
-                            <AlertTriangle size={14}/>
-                            <p className="text-[10px] font-bold">Nenhum domínio base configurado em 'System Settings'. Digite o domínio completo.</p>
+                            {domainMode === 'custom' ? (
+                                <div className="relative">
+                                    <Globe2 className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400" size={18}/>
+                                    <input 
+                                        autoFocus
+                                        value={customDomain}
+                                        onChange={(e) => setCustomDomain(e.target.value)}
+                                        placeholder="app.meudominio.com"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 pl-14 pr-6 text-lg font-bold text-slate-900 outline-none focus:ring-4 focus:ring-indigo-500/10"
+                                    />
+                                    <p className="text-[10px] text-slate-400 font-bold mt-2 ml-2">Aponte o registro A/CNAME para este servidor.</p>
+                                </div>
+                            ) : (
+                                <div className="flex items-center bg-slate-50 border border-slate-200 rounded-2xl overflow-hidden focus-within:ring-4 focus-within:ring-indigo-500/10">
+                                    <input 
+                                        value={subdomain}
+                                        onChange={(e) => setSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                                        placeholder="app-name"
+                                        className="flex-1 bg-transparent py-4 pl-6 text-lg font-bold text-slate-900 outline-none text-right"
+                                    />
+                                    <div className="bg-slate-100 py-4 pr-6 pl-2 text-slate-500 font-bold text-sm border-l border-slate-200">
+                                        .{systemDomain}
+                                    </div>
+                                </div>
+                            )}
                         </div>
-                    )}
-                 </div>
-                 
-                 <button onClick={handleInstall} disabled={installing || !subdomain} className="w-full bg-indigo-600 text-white py-5 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl flex items-center justify-center gap-3 hover:bg-indigo-700 transition-all disabled:opacity-50">
-                    {installing ? <Loader2 className="animate-spin" size={18}/> : 'Iniciar Instalação'}
-                 </button>
-                 <button onClick={() => setInstallModal(null)} className="w-full py-4 text-xs font-bold text-slate-400 hover:text-slate-600">Cancelar</button>
-              </div>
+
+                        {/* 2. SSL SELECTOR */}
+                        <div className="space-y-3">
+                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 flex items-center gap-2"><Lock size={12}/> Certificado SSL</label>
+                            <select 
+                                value={sslMode} 
+                                onChange={(e) => setSslMode(e.target.value as any)}
+                                className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 px-6 text-sm font-bold text-slate-800 outline-none focus:ring-4 focus:ring-indigo-500/10 cursor-pointer"
+                            >
+                                <option value="none">Sem SSL (HTTP / Cloudflare Flexible)</option>
+                                <option value="letsencrypt">Gerar Novo (Let's Encrypt)</option>
+                                {availableCerts.length > 0 && <option value="existing">Usar Certificado Existente</option>}
+                            </select>
+
+                            {sslMode === 'letsencrypt' && (
+                                <input 
+                                    value={adminEmail}
+                                    onChange={(e) => setAdminEmail(e.target.value)}
+                                    placeholder="E-mail para registro SSL"
+                                    className="w-full bg-white border border-slate-200 rounded-2xl py-3 px-6 text-xs font-bold outline-none animate-in fade-in slide-in-from-top-2"
+                                />
+                            )}
+                            
+                            {sslMode === 'existing' && availableCerts.length > 0 && (
+                                <div className="p-4 bg-indigo-50 border border-indigo-100 rounded-2xl text-xs font-medium text-indigo-800">
+                                    O sistema tentará usar automaticamente o certificado correspondente ao domínio escolhido.
+                                </div>
+                            )}
+                        </div>
+                        
+                        <div className="flex gap-4 pt-4">
+                            <button onClick={resetInstallModal} className="flex-1 py-4 text-xs font-bold text-slate-400 hover:text-slate-600">Cancelar</button>
+                            <button onClick={handleInstall} disabled={installing || (domainMode === 'custom' && !customDomain) || (domainMode === 'subdomain' && !subdomain)} className="flex-[2] bg-slate-900 text-white py-5 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl flex items-center justify-center gap-3 hover:bg-indigo-600 transition-all disabled:opacity-50">
+                                {installing ? <Loader2 className="animate-spin" size={18}/> : 'Deploy Application'}
+                            </button>
+                        </div>
+                    </div>
+                  </>
+              )}
+
+              {installStep === 'deploying' && (
+                  <div className="flex flex-col items-center justify-center py-20">
+                      <Loader2 size={60} className="animate-spin text-indigo-600 mb-6" />
+                      <h3 className="text-xl font-black text-slate-900">Provisionando Infraestrutura...</h3>
+                      <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-2">Docker Compose & Nginx</p>
+                  </div>
+              )}
+
+              {installStep === 'success' && (
+                  <div className="flex flex-col items-center justify-center py-10 text-center">
+                      <div className="w-20 h-20 bg-emerald-500 rounded-full flex items-center justify-center text-white mb-6 shadow-xl animate-bounce">
+                          <CheckCircle2 size={40} />
+                      </div>
+                      <h3 className="text-2xl font-black text-slate-900 mb-2">Deploy Concluído!</h3>
+                      <p className="text-slate-500 text-sm font-medium mb-8 max-w-sm">
+                          Sua aplicação está rodando. O SSL pode levar alguns minutos para propagar se foi gerado agora.
+                      </p>
+                      <button onClick={() => { resetInstallModal(); setActiveTab('installed'); }} className="bg-slate-900 text-white px-10 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl hover:bg-emerald-600 transition-all">
+                          Ver Aplicação
+                      </button>
+                  </div>
+              )}
+
            </div>
         </div>
       )}
