@@ -28,6 +28,11 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # AUMENTO DE TIMEOUT PARA INSTALL DE APPS PESADOS
+        proxy_read_timeout 600;
+        proxy_connect_timeout 600;
+        proxy_send_timeout 600;
     }
 
     # Data Plane API
@@ -37,6 +42,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        
+        proxy_read_timeout 600;
     }
     
     # Short URLs
@@ -56,11 +63,10 @@ server {
     client_max_body_size 100M;
 
     # Certificados Padronizados do Sistema (Fallback)
-    # O backend garante que estes arquivos sempre existem (mesmo que dummy na inicialização)
     ssl_certificate /etc/letsencrypt/live/system/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/system/privkey.pem;
 
-    # Configurações Modernas de Segurança (Compatível com Cloudflare Full SSL)
+    # Configurações Modernas de Segurança
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
 
@@ -78,6 +84,11 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # AUMENTO DE TIMEOUT PARA HTTPS
+        proxy_read_timeout 600;
+        proxy_connect_timeout 600;
+        proxy_send_timeout 600;
     }
 
     location /api/data/ {
@@ -86,6 +97,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        
+        proxy_read_timeout 600;
     }
     
     location ~ ^/(rpc|tables|auth|storage|realtime)/ {

@@ -41,7 +41,7 @@ export class AppStore {
         }
     }
 
-    // --- 2. INSTALAÇÃO (ROBUST DEPLOY) ---
+    // --- 2. INSTALAÇÃO (ROBUST DEPLOY WITH .ENV) ---
     public async installApp(projectSlug: string, appId: string, domain: string) {
         // 1. Validação de Duplicidade de Domínio
         const cleanDomain = domain.trim().toLowerCase();
@@ -106,52 +106,95 @@ export class AppStore {
             throw new Error(`Erro ao baixar template: ${e.message}`);
         }
 
-        // C. Substituir Variáveis no Template
+        // C. Preparar Variáveis (.ENV e Replace)
         const networkName = await this.getDockerNetworkName();
         const containerPrefix = `app-${shortId}`;
         
-        let finalCompose = composeTemplate
-            .replace(/\${CONTAINER_PREFIX}/g, containerPrefix)
-            .replace(/\${DOMAIN}/g, cleanDomain)
-            .replace(/\${NETWORK_NAME}/g, networkName)
-            .replace(/\${DB_HOST}/g, 'cascata-db') 
-            .replace(/\${DB_NAME}/g, dbName)
-            .replace(/\${DB_USER}/g, dbUser)
-            .replace(/\${DB_PASS}/g, dbPass)
-            .replace(/\${ENCRYPTION_KEY}/g, encryptionKey)
-            .replace(/\${JWT_SECRET}/g, jwtSecret)
-            .replace(/\${RUNNER_SECRET}/g, runnerSecret);
+        // Mapeamento exaustivo para cobrir diferentes padrões de template
+        const vars: Record<string, string> = {
+            CONTAINER_PREFIX: containerPrefix,
+            DOMAIN: cleanDomain,
+            SUBDOMAIN: cleanDomain.split('.')[0],
+            NETWORK_NAME: networkName,
+            
+            // Database Standard
+            DB_HOST: 'cascata-db',
+            DB_PORT: '5432',
+            DB_NAME: dbName,
+            DB_USER: dbUser,
+            DB_PASS: dbPass,
+            
+            // Postgres Specific
+            POSTGRES_DB: dbName,
+            POSTGRES_USER: dbUser,
+            POSTGRES_PASSWORD: dbPass,
+            
+            // Secrets & Keys
+            ENCRYPTION_KEY: encryptionKey,
+            JWT_SECRET: jwtSecret,
+            
+            // N8N Critical Secrets (Correção do erro "missing value")
+            RUNNER_SECRET: runnerSecret, 
+            N8N_RUNNERS_SECRET: runnerSecret, // Variável obrigatória para N8N v1+ distributed
+            
+            // N8N Specifics
+            N8N_ENCRYPTION_KEY: encryptionKey,
+            N8N_USER_MANAGEMENT_JWT_SECRET: jwtSecret,
+            N8N_HOST: cleanDomain,
+            N8N_PORT: '5678',
+            N8N_PROTOCOL: 'https',
+            WEBHOOK_URL: `https://${cleanDomain}/`,
+            PROXY_HOPS: '1', // Correção do warning: Indica que há 1 proxy (Nginx) na frente
+            
+            // Generic
+            TZ: 'UTC',
+            GENERIC_TIMEZONE: 'UTC'
+        };
 
-        // D. Salvar Arquivo
+        // Replace placeholders in file (Legacy support for templates using ${VAR})
+        let finalCompose = composeTemplate;
+        for (const [key, val] of Object.entries(vars)) {
+            const regex = new RegExp(`\\$\\{${key}\\}`, 'g');
+            finalCompose = finalCompose.replace(regex, val);
+        }
+
+        // D. Salvar Arquivos
         const appDir = path.join(APPS_ROOT, deployId);
         if (!fs.existsSync(appDir)) fs.mkdirSync(appDir, { recursive: true });
+        
         fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), finalCompose);
         
+        // CRÍTICO: Gerar arquivo .env para que o docker-compose pegue as variáveis
+        // que não foram substituídas diretamente no YAML (interpolação nativa)
+        const envContent = Object.entries(vars).map(([k, v]) => `${k}=${v}`).join('\n');
+        fs.writeFileSync(path.join(appDir, '.env'), envContent);
+        
         // E. Registrar no Banco
-        const envVars = {
+        const envVarsForDb = {
             DB_NAME: dbName,
             DB_USER: dbUser,
             DB_HOST: 'cascata-db',
-            N8N_ENCRYPTION_KEY: encryptionKey, 
             INSTALL_DATE: new Date().toISOString()
         };
 
         await this.systemPool.query(
             `INSERT INTO system.apps (id, project_slug, type, domain, port_internal, container_name_main, env_vars, status) 
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'provisioning')`,
-            [deployId, projectSlug, appId, cleanDomain, 5678, `${containerPrefix}-main`, JSON.stringify(envVars)]
+            [deployId, projectSlug, appId, cleanDomain, 5678, `${containerPrefix}-main`, JSON.stringify(envVarsForDb)]
         );
 
-        // F. Executar Deploy (FIX: Usando docker-compose com hífen para Alpine)
+        // F. Executar Deploy (Usando CWD para pegar o .env)
         try {
-            await execAsync(`docker-compose -f ${path.join(appDir, 'docker-compose.yml')} up -d`);
+            // Executa no diretório do app para garantir que o .env seja lido
+            // Usamos docker-compose (hifenizado) para compatibilidade Alpine se instalado via pip/pkg
+            await execAsync(`docker-compose up -d`, { cwd: appDir });
             await this.systemPool.query(`UPDATE system.apps SET status = 'running' WHERE id = $1`, [deployId]);
             return { success: true, id: deployId };
         } catch (e: any) {
             console.error("[AppStore] Docker Deploy Failed:", e);
             await this.systemPool.query(`UPDATE system.apps SET status = 'error' WHERE id = $1`, [deployId]);
-            // Não deletamos o registro para permitir debug, o usuário pode deletar pela UI
-            throw new Error(`Comando Docker falhou. Verifique se a imagem existe e se o template é válido. Detalhes: ${e.message}`);
+            // Manter registro para debug, mas lançar erro
+            throw new Error(`Comando Docker falhou (Verifique logs): ${e.message}`);
         }
     }
 
@@ -159,7 +202,7 @@ export class AppStore {
         const appDir = path.join(APPS_ROOT, appId);
         if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
             try {
-                await execAsync(`docker-compose -f ${path.join(appDir, 'docker-compose.yml')} down`);
+                await execAsync(`docker-compose down`, { cwd: appDir });
             } catch (e) {
                 console.warn(`[AppStore] Warning on stop: ${e}`);
             }
@@ -170,7 +213,7 @@ export class AppStore {
     public async startApp(appId: string) {
         const appDir = path.join(APPS_ROOT, appId);
         if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
-            await execAsync(`docker-compose -f ${path.join(appDir, 'docker-compose.yml')} up -d`);
+            await execAsync(`docker-compose up -d`, { cwd: appDir });
         } else {
             throw new Error("Arquivos da aplicação não encontrados.");
         }
@@ -182,10 +225,11 @@ export class AppStore {
         console.log(`[AppStore] Deleting app ${appId}...`);
         const appDir = path.join(APPS_ROOT, appId);
         
-        // 1. Tentar derrubar containers (ignora erro se já não existirem ou docker falhar)
+        // 1. Tentar derrubar containers
         if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
             try {
-                await execAsync(`docker-compose -f ${path.join(appDir, 'docker-compose.yml')} down -v`);
+                // Usar cwd para garantir que variáveis do .env (como network names) sejam resolvidas
+                await execAsync(`docker-compose down -v`, { cwd: appDir });
             } catch (e: any) {
                 console.warn(`[AppStore] Docker down failed (ignoring cleanup): ${e.message}`);
             }
@@ -205,7 +249,7 @@ export class AppStore {
             console.warn(`[AppStore] DB Cleanup failed:`, e);
         }
 
-        // 3. Remover registro do banco (CRÍTICO: Isso previne o erro 500 de persistir na UI)
+        // 3. Remover registro do banco
         await this.systemPool.query(`DELETE FROM system.apps WHERE id = $1`, [appId]);
         
         // 4. Remover arquivos
@@ -223,7 +267,6 @@ export class AppStore {
         if (res.rows.length === 0) throw new Error("App not found");
         const container = res.rows[0].container_name_main;
         try {
-            // Logs usa docker CLI normal
             const { stdout } = await execAsync(`docker logs --tail ${lines} ${container}`);
             return stdout;
         } catch (e) {
@@ -233,7 +276,6 @@ export class AppStore {
 
     private async getDockerNetworkName(): Promise<string> {
         try {
-            // Tenta descobrir a rede do Nginx automaticamente
             const containerName = process.env.NGINX_CONTAINER_NAME || 'cascata-nginx';
             const { stdout } = await execAsync(`docker inspect ${containerName} --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}'`);
             return stdout.trim() || 'bridge';

@@ -118,8 +118,21 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
       });
       
       if (!installRes.ok) {
-          const errData = await installRes.json();
-          throw new Error(errData.error || "Erro na instalação do container");
+          let errorMsg = "Erro na instalação";
+          try {
+              const errData = await installRes.json();
+              errorMsg = errData.error;
+          } catch (jsonErr) {
+              // Se falhar o parse JSON, lê como texto (provavelmente erro HTML do Nginx 504/502)
+              const textErr = await installRes.text();
+              console.error("Install Error (Non-JSON):", textErr);
+              if (textErr.includes("504 Gateway Time-out")) {
+                  errorMsg = "O servidor demorou muito para responder (Timeout). O app pode estar instalando em segundo plano. Verifique a aba 'Installed' em alguns minutos.";
+              } else {
+                  errorMsg = `Erro no servidor: ${installRes.status} ${installRes.statusText}`;
+              }
+          }
+          throw new Error(errorMsg);
       }
 
       // 3. SSL Handling (Se selecionado)
@@ -145,7 +158,7 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
       setInstallStep('success');
       fetchInstalledApps();
     } catch (e: any) {
-      alert(`Falha crítica: ${e.message}`);
+      alert(`Falha: ${e.message}`);
       setInstallStep('config');
     } finally {
       setInstalling(false);
