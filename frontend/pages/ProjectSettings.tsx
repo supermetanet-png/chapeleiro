@@ -155,12 +155,17 @@ const ProjectSettings: React.FC<{ projectId: string }> = ({ projectId }) => {
       if (!response.ok) throw new Error((await response.json()).error || 'Erro ao salvar certificado.');
       
       setSuccess(sslMode === 'letsencrypt' 
-        ? 'Solicitação enviada ao Certbot. Aguarde validação.' 
+        ? 'Solicitação enviada ao Certbot. Aguarde validação e reload (aprox. 30s).' 
         : 'Certificados PEM salvos e aplicados.');
       
       setShowCertModal(false);
-      fetchAvailableCerts();
-      setTimeout(() => setSuccess(null), 3000);
+      
+      // Delay fetch to allow file system sync
+      setTimeout(() => {
+          fetchAvailableCerts();
+          setSuccess(null);
+      }, 4000);
+
     } catch (err: any) {
       alert(err.message);
     } finally {
@@ -178,7 +183,10 @@ const ProjectSettings: React.FC<{ projectId: string }> = ({ projectId }) => {
           });
           if (!res.ok) throw new Error("Erro ao deletar");
           setSuccess("Certificado removido.");
-          fetchAvailableCerts();
+          setTimeout(() => {
+              fetchAvailableCerts();
+              setSuccess(null);
+          }, 2000);
       } catch (e) {
           alert("Erro ao remover certificado.");
       } finally {

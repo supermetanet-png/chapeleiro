@@ -59,7 +59,7 @@ const systemPool = new Pool({
   idleTimeoutMillis: 30000 
 });
 
-// --- INTEGRATED CERTIFICATE MANAGER (Updated for SNI & Sync) ---
+// --- INTEGRATED CERTIFICATE MANAGER (Updated for SNI & Sync & RELOAD) ---
 export type CertProvider = 'traefik' | 'certbot' | 'manual' | 'none';
 
 class CertificateManager {
@@ -71,6 +71,18 @@ class CertificateManager {
   private static validateDomain(domain: string): boolean {
     const regex = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
     return regex.test(domain) && !domain.includes('..');
+  }
+
+  // Helper para recarregar o Nginx via Docker Socket
+  private static reloadNginx() {
+      const containerName = process.env.NGINX_CONTAINER_NAME || 'cascata-nginx';
+      try {
+          console.log(`[CertManager] Attempting Nginx reload on container: ${containerName}...`);
+          execSync(`docker exec ${containerName} nginx -s reload`);
+          console.log('[CertManager] Nginx reloaded successfully.');
+      } catch (e: any) {
+          console.error(`[CertManager] Failed to reload Nginx. Ensure docker socket is mounted and container name is correct. Error: ${e.message}`);
+      }
   }
 
   // Garante que existe um certificado "system" para o Nginx não crashar
@@ -134,6 +146,7 @@ class CertificateManager {
         
         // Verifica se os arquivos de certificado realmente existem
         if (fs.existsSync(path.join(certPath, 'fullchain.pem')) && fs.existsSync(path.join(certPath, 'privkey.pem'))) {
+          // Usamos o container_name fixo 'cascata-backend-data' para o proxy pass
           const configContent = `
 server {
     listen 443 ssl;
@@ -148,7 +161,7 @@ server {
     client_max_body_size 100M;
 
     location / {
-        proxy_pass http://backend_data:3000;
+        proxy_pass http://cascata-backend-data:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -162,13 +175,9 @@ server {
         }
       }
       
-      // Reload Nginx
-      try {
-          // Tenta recarregar o Nginx via comando docker exec se estiver rodando (assumindo acesso ao socket ou sinal)
-          // Em setup simples, dependemos do Nginx detectar ou script externo. 
-          // Mas vamos tentar escrever um arquivo 'reload' se tiver um watcher, ou apenas logar.
-          console.log(`[CertManager] Generated ${generatedCount} config files. Please ensure Nginx reloads.`);
-      } catch(e) {}
+      console.log(`[CertManager] Generated ${generatedCount} config files.`);
+      // CRITICAL: Trigger Reload
+      this.reloadNginx();
 
     } catch (e) {
       console.error('[CertManager] Failed to rebuild configs:', e);
@@ -267,7 +276,7 @@ server {
                 if (code === 0) {
                     try {
                         await finishSetup();
-                        resolve({ success: true, message: "Certificado gerado com sucesso! Nginx será atualizado." });
+                        resolve({ success: true, message: "Certificado gerado com sucesso! Nginx será recarregado automaticamente." });
                     } catch (e: any) {
                         reject(new Error(`Certbot OK, mas falha na pós-configuração: ${e.message}`));
                     }

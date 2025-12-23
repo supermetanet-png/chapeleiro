@@ -2,6 +2,7 @@
 services:
   nginx:
     image: nginx:alpine
+    container_name: cascata-nginx
     # Mapeamento de portas dinâmico.
     # VPS/Standalone: Usa 80:80 e 443:443 (Definido no .env)
     # EasyPanel/PaaS: Se der conflito, altere APP_HTTP_PORT no .env para 3005
@@ -23,12 +24,15 @@ services:
     build: 
       context: ./backend
       dockerfile: Dockerfile
+    container_name: cascata-backend-control
     environment:
       - SERVICE_MODE=CONTROL_PLANE
       - SYSTEM_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
       - SYSTEM_JWT_SECRET=${SYSTEM_JWT_SECRET}
       - PORT=3000
+      - NGINX_CONTAINER_NAME=cascata-nginx
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # PERMISSÃO CRÍTICA PARA RELOAD
       - acme_challenge:/var/www/html/.well-known/acme-challenge
       - certs:/etc/letsencrypt
       - storage_data:/app/../storage
@@ -42,6 +46,7 @@ services:
     build: 
       context: ./backend
       dockerfile: Dockerfile
+    container_name: cascata-backend-data
     environment:
       - SERVICE_MODE=DATA_PLANE
       - SYSTEM_DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
@@ -58,10 +63,12 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    container_name: cascata-frontend
     restart: always
 
   db:
     image: postgres:15-alpine
+    container_name: cascata-db
     restart: always
     environment:
       POSTGRES_USER: ${DB_USER:-cascata_admin}
