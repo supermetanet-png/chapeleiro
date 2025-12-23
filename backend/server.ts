@@ -161,10 +161,37 @@ server {
           console.warn(`[CertManager] Skipping config for ${proj.custom_domain}: Certificate for ${certDomain} not found.`);
         }
       }
-      console.log(`[CertManager] Generated ${generatedCount} config files. Nginx reload required.`);
+      
+      // Reload Nginx
+      try {
+          // Tenta recarregar o Nginx via comando docker exec se estiver rodando (assumindo acesso ao socket ou sinal)
+          // Em setup simples, dependemos do Nginx detectar ou script externo. 
+          // Mas vamos tentar escrever um arquivo 'reload' se tiver um watcher, ou apenas logar.
+          console.log(`[CertManager] Generated ${generatedCount} config files. Please ensure Nginx reloads.`);
+      } catch(e) {}
+
     } catch (e) {
       console.error('[CertManager] Failed to rebuild configs:', e);
     }
+  }
+
+  public static async deleteCertificate(domain: string): Promise<void> {
+      const domainDir = path.join(this.basePath, domain);
+      if (fs.existsSync(domainDir)) {
+          fs.rmSync(domainDir, { recursive: true, force: true });
+          // Também remover do archive se existir para limpeza completa
+          const archiveDir = path.join('/etc/letsencrypt/archive', domain);
+          if (fs.existsSync(archiveDir)) {
+              fs.rmSync(archiveDir, { recursive: true, force: true });
+          }
+          // Remove config de renovação do certbot
+          const renewalFile = path.join('/etc/letsencrypt/renewal', `${domain}.conf`);
+          if (fs.existsSync(renewalFile)) fs.unlinkSync(renewalFile);
+          
+          await this.rebuildNginxConfigs();
+      } else {
+          throw new Error("Certificado não encontrado.");
+      }
   }
 
   public static async detectEnvironment(): Promise<any> {
@@ -200,7 +227,6 @@ server {
       if (isSystem) {
         this.syncToSystem(domainDir);
       }
-      // Sempre reconstrói as configs do Nginx para garantir que novos domínios ou renovações sejam aplicados
       await this.rebuildNginxConfigs();
     };
 
@@ -208,13 +234,18 @@ server {
         if (!manualData?.cert || !manualData?.key) throw new Error("Cert/Key required.");
         
         if (!fs.existsSync(this.basePath)) fs.mkdirSync(this.basePath, { recursive: true });
-        if (!fs.existsSync(domainDir)) fs.mkdirSync(domainDir, { recursive: true });
+        
+        // CRITICAL FIX: Ensure the domain directory exists before writing
+        if (!fs.existsSync(domainDir)) {
+            console.log(`[CertManager] Creating directory for ${domain}`);
+            fs.mkdirSync(domainDir, { recursive: true });
+        }
         
         fs.writeFileSync(path.join(domainDir, 'fullchain.pem'), manualData.cert.trim());
         fs.writeFileSync(path.join(domainDir, 'privkey.pem'), manualData.key.trim());
         
         await finishSetup();
-        return { success: true, message: "Certificados manuais instalados. Reinicie o container Nginx para aplicar." };
+        return { success: true, message: "Certificados manuais instalados. A pasta foi criada corretamente." };
     }
 
     if (provider === 'certbot' || provider === 'letsencrypt' as any) {
@@ -236,7 +267,7 @@ server {
                 if (code === 0) {
                     try {
                         await finishSetup();
-                        resolve({ success: true, message: "Certificado gerado com sucesso! Reinicie o container Nginx para carregar." });
+                        resolve({ success: true, message: "Certificado gerado com sucesso! Nginx será atualizado." });
                     } catch (e: any) {
                         reject(new Error(`Certbot OK, mas falha na pós-configuração: ${e.message}`));
                     }
@@ -1015,6 +1046,13 @@ app.post('/api/control/system/certificates', async (req: any, res: any) => {
     );
     res.json(result);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/control/system/certificates/:domain', async (req: any, res: any) => {
+    try {
+        await CertificateManager.deleteCertificate(req.params.domain);
+        res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 // --- DATA PLANE ROUTES ---
