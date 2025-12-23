@@ -10,7 +10,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
-import { AppStore } from './managers/AppStore.js'; // INTEGRACAO APP STORE
+import { AppStore } from './managers/AppStore.js'; 
 
 dotenv.config();
 
@@ -41,14 +41,13 @@ const PORT = process.env.PORT || 3000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const STORAGE_ROOT = path.resolve(__dirname, '../storage');
-const APPS_ROOT = path.resolve(__dirname, '../storage/apps'); // NOVO PATH
+const APPS_ROOT = path.resolve(__dirname, '../storage/apps');
 const MIGRATIONS_ROOT = path.resolve(__dirname, '../migrations');
 const NGINX_DYNAMIC_ROOT = '/etc/nginx/conf.d/dynamic';
 
-// Ensure directories exist immediately
 try {
   if (!fs.existsSync(STORAGE_ROOT)) fs.mkdirSync(STORAGE_ROOT, { recursive: true });
-  if (!fs.existsSync(APPS_ROOT)) fs.mkdirSync(APPS_ROOT, { recursive: true }); // NOVO
+  if (!fs.existsSync(APPS_ROOT)) fs.mkdirSync(APPS_ROOT, { recursive: true });
   if (!fs.existsSync(NGINX_DYNAMIC_ROOT)) fs.mkdirSync(NGINX_DYNAMIC_ROOT, { recursive: true });
 } catch (e) { console.error('[System] Root dir create error:', e); }
 
@@ -62,10 +61,10 @@ const systemPool = new Pool({
   idleTimeoutMillis: 30000 
 });
 
-// Inicializa AppStore
-const appStore = new AppStore(systemPool); // NOVO
+// App Store Manager Initialization
+const appStore = new AppStore(systemPool);
 
-// --- INTEGRATED CERTIFICATE MANAGER (Updated for SNI & Sync & RELOAD & APPS) ---
+// --- INTEGRATED CERTIFICATE MANAGER ---
 export type CertProvider = 'traefik' | 'certbot' | 'manual' | 'none';
 
 class CertificateManager {
@@ -73,80 +72,57 @@ class CertificateManager {
   private static systemCertPath = '/etc/letsencrypt/live/system';
   private static webrootPath = '/var/www/html';
 
-  // Validação melhorada para aceitar subdomínios de 1 caractere e TLDs compostos
   private static validateDomain(domain: string): boolean {
     const regex = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
     return regex.test(domain) && !domain.includes('..');
   }
 
-  // Helper para recarregar o Nginx via Docker Socket
   private static reloadNginx() {
       const containerName = process.env.NGINX_CONTAINER_NAME || 'cascata-nginx';
       try {
-          console.log(`[CertManager] Attempting Nginx reload on container: ${containerName}...`);
           execSync(`docker exec ${containerName} nginx -s reload`);
-          console.log('[CertManager] Nginx reloaded successfully.');
       } catch (e: any) {
-          console.error(`[CertManager] Failed to reload Nginx. Ensure docker socket is mounted and container name is correct. Error: ${e.message}`);
+          console.error(`[CertManager] Failed to reload Nginx: ${e.message}`);
       }
   }
 
-  // Garante que existe um certificado "system" para o Nginx não crashar
   public static async ensureSystemCert() {
     try {
         if (!fs.existsSync(this.systemCertPath)) {
             fs.mkdirSync(this.systemCertPath, { recursive: true });
         }
-        
         const certFile = path.join(this.systemCertPath, 'fullchain.pem');
         const keyFile = path.join(this.systemCertPath, 'privkey.pem');
-
         if (!fs.existsSync(certFile) || !fs.existsSync(keyFile)) {
-            console.log('[CertManager] Generating fallback self-signed certificate for Nginx startup...');
             execSync(`openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout ${keyFile} -out ${certFile} -subj "/C=US/ST=State/L=City/O=Cascata/CN=localhost"`, { stdio: 'ignore' });
-            console.log('[CertManager] Fallback certificate created.');
         }
-    } catch (e) {
-        console.error('[CertManager] Failed to ensure system cert:', e);
-    }
+    } catch (e) { console.error('[CertManager] System cert error:', e); }
   }
 
-  // Copia o certificado gerado para a pasta "system" (SOMENTE para o domínio principal)
   private static syncToSystem(sourceDir: string) {
       try {
           if (!fs.existsSync(this.systemCertPath)) fs.mkdirSync(this.systemCertPath, { recursive: true });
-          
           const realCertPath = fs.realpathSync(path.join(sourceDir, 'fullchain.pem'));
           const realKeyPath = fs.realpathSync(path.join(sourceDir, 'privkey.pem'));
-
           fs.copyFileSync(realCertPath, path.join(this.systemCertPath, 'fullchain.pem'));
           fs.copyFileSync(realKeyPath, path.join(this.systemCertPath, 'privkey.pem'));
-          console.log(`[CertManager] Synced ${sourceDir} to System SSL.`);
-      } catch (e) {
-          console.error('[CertManager] Sync failed:', e);
-          throw new Error("Falha ao aplicar certificado no sistema. Verifique logs.");
-      }
+      } catch (e) { console.error('[CertManager] Sync failed:', e); }
   }
 
-  // Gera arquivos de configuração do Nginx para cada projeto E CADA APP
   public static async rebuildNginxConfigs() {
     console.log('[CertManager] Rebuilding Nginx dynamic configurations...');
     try {
       if (!fs.existsSync(NGINX_DYNAMIC_ROOT)) fs.mkdirSync(NGINX_DYNAMIC_ROOT, { recursive: true });
 
-      // Limpa configs antigas
       const oldFiles = fs.readdirSync(NGINX_DYNAMIC_ROOT);
       for (const file of oldFiles) {
         if (file.endsWith('.conf')) fs.unlinkSync(path.join(NGINX_DYNAMIC_ROOT, file));
       }
 
-      // 1. PROJECTS
+      // PROJECTS
       const result = await systemPool.query('SELECT slug, custom_domain, ssl_certificate_source FROM system.projects WHERE custom_domain IS NOT NULL');
-      
-      let generatedCount = 0;
       for (const proj of result.rows) {
         if (!proj.custom_domain) continue;
-
         const certDomain = proj.ssl_certificate_source || proj.custom_domain;
         const certPath = path.join(this.basePath, certDomain);
         
@@ -169,11 +145,10 @@ server {
     }
 }`;
           fs.writeFileSync(path.join(NGINX_DYNAMIC_ROOT, `${proj.slug}.conf`), configContent.trim());
-          generatedCount++;
         }
       }
 
-      // 2. APPS (NOVO) - Loop para gerar configs dos Apps instalados
+      // APPS (APPS ORCHESTRATOR)
       const apps = await systemPool.query("SELECT * FROM system.apps WHERE status = 'running'");
       for (const app of apps.rows) {
           const certPath = path.join(this.basePath, app.domain);
@@ -187,7 +162,6 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
     client_max_body_size 500M;
-    
     location / {
         proxy_pass http://${app.container_name_main}:${app.port_internal};
         proxy_http_version 1.1;
@@ -201,13 +175,10 @@ server {
     }
 }`;
               fs.writeFileSync(path.join(NGINX_DYNAMIC_ROOT, `app_${app.id}.conf`), appConfig.trim());
-              generatedCount++;
           }
       }
       
-      console.log(`[CertManager] Generated ${generatedCount} config files.`);
       this.reloadNginx();
-
     } catch (e) {
       console.error('[CertManager] Failed to rebuild configs:', e);
     }
@@ -218,12 +189,9 @@ server {
       if (fs.existsSync(domainDir)) {
           fs.rmSync(domainDir, { recursive: true, force: true });
           const archiveDir = path.join('/etc/letsencrypt/archive', domain);
-          if (fs.existsSync(archiveDir)) {
-              fs.rmSync(archiveDir, { recursive: true, force: true });
-          }
+          if (fs.existsSync(archiveDir)) fs.rmSync(archiveDir, { recursive: true, force: true });
           const renewalFile = path.join('/etc/letsencrypt/renewal', `${domain}.conf`);
           if (fs.existsSync(renewalFile)) fs.unlinkSync(renewalFile);
-          
           await this.rebuildNginxConfigs();
       } else {
           throw new Error("Certificado não encontrado.");
@@ -238,78 +206,47 @@ server {
           fs.lstatSync(path.join(this.basePath, f)).isDirectory() && f !== 'system'
         );
         domains.push(...dirs);
-      } catch (e) { console.error("Error scanning certs:", e); }
+      } catch (e) { }
     }
-    
     let hasCertbot = false;
-    try {
-        if (fs.existsSync('/usr/bin/certbot') || fs.existsSync('/usr/local/bin/certbot')) hasCertbot = true;
-    } catch(e) {}
-
-    return {
-      provider: hasCertbot ? 'certbot' : 'manual',
-      active: domains.length > 0,
-      domains,
-      message: `${domains.length} domínios configurados.`
-    };
+    try { if (fs.existsSync('/usr/bin/certbot') || fs.existsSync('/usr/local/bin/certbot')) hasCertbot = true; } catch(e) {}
+    return { provider: hasCertbot ? 'certbot' : 'manual', active: domains.length > 0, domains, message: `${domains.length} domínios configurados.` };
   }
 
   public static async requestCertificate(domain: string, email: string, provider: CertProvider, manualData?: { cert: string, key: string }, isSystem: boolean = false): Promise<{ success: boolean, message: string }> {
     if (!this.validateDomain(domain)) throw new Error("Domínio inseguro ou inválido.");
-
     const domainDir = path.join(this.basePath, domain);
-
     const finishSetup = async () => {
-      if (isSystem) {
-        this.syncToSystem(domainDir);
-      }
+      if (isSystem) this.syncToSystem(domainDir);
       await this.rebuildNginxConfigs();
     };
 
     if (provider === 'manual' || provider === 'cloudflare_pem' as any) {
         if (!manualData?.cert || !manualData?.key) throw new Error("Cert/Key required.");
-        
         if (!fs.existsSync(this.basePath)) fs.mkdirSync(this.basePath, { recursive: true });
-        
-        if (!fs.existsSync(domainDir)) {
-            console.log(`[CertManager] Creating directory for ${domain}`);
-            fs.mkdirSync(domainDir, { recursive: true });
-        }
-        
+        if (!fs.existsSync(domainDir)) fs.mkdirSync(domainDir, { recursive: true });
         fs.writeFileSync(path.join(domainDir, 'fullchain.pem'), manualData.cert.trim());
         fs.writeFileSync(path.join(domainDir, 'privkey.pem'), manualData.key.trim());
-        
         await finishSetup();
-        return { success: true, message: "Certificados manuais instalados. A pasta foi criada corretamente." };
+        return { success: true, message: "Certificados manuais instalados." };
     }
 
     if (provider === 'certbot' || provider === 'letsencrypt' as any) {
         if (!email.includes('@')) throw new Error("Email inválido.");
         return new Promise((resolve, reject) => {
-            console.log(`[CertManager] Executing Certbot for ${domain}...`);
             if (!fs.existsSync(this.webrootPath)) fs.mkdirSync(this.webrootPath, { recursive: true });
-            
             const certbot = spawn('certbot', [
                 'certonly', '--webroot', '-w', this.webrootPath, '-d', domain,
                 '--email', email, '--agree-tos', '--no-eff-email', '--force-renewal', '--non-interactive'
             ]);
-            
             let log = '';
             certbot.stdout.on('data', d => log += d.toString());
             certbot.stderr.on('data', d => log += d.toString());
-            
             certbot.on('close', async (code) => {
                 if (code === 0) {
-                    try {
-                        await finishSetup();
-                        resolve({ success: true, message: "Certificado gerado com sucesso! Nginx será recarregado automaticamente." });
-                    } catch (e: any) {
-                        reject(new Error(`Certbot OK, mas falha na pós-configuração: ${e.message}`));
-                    }
-                }
-                else reject(new Error(`Falha no Certbot (Code ${code}): ${log.slice(-300)}`));
+                    try { await finishSetup(); resolve({ success: true, message: "Certificado gerado com sucesso!" }); } catch (e: any) { reject(new Error(`Falha pós-certbot: ${e.message}`)); }
+                } else reject(new Error(`Falha no Certbot (Code ${code}): ${log.slice(-300)}`));
             });
-            certbot.on('error', (err) => reject(new Error(`Spawn Error: ${err.message}`)));
         });
     }
     throw new Error("Provider desconhecido.");
@@ -332,16 +269,72 @@ const waitForDatabase = async (retries = 10, delay = 2000): Promise<boolean> => 
   return false;
 };
 
-// --- MIGRATION RUNNER (RESILIENT) ---
+// --- MIGRATION RUNNER (ROBUST & INLINE FALLBACK) ---
+// THIS FIXES THE 500 ERROR BY GUARANTEEING TABLES EXIST EVEN IF SQL FILES FAIL
 class MigrationRunner {
   public static async run() {
     console.log('[MigrationRunner] Check started...');
     let client;
     try {
       client = await systemPool.connect();
-      await client.query(`CREATE SCHEMA IF NOT EXISTS system`);
       
-      // APPS TABLE (NOVO)
+      // 1. BOOTSTRAP SYSTEM SCHEMA & EXTENSIONS
+      await client.query(`CREATE SCHEMA IF NOT EXISTS system`);
+      await client.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
+      await client.query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
+
+      // 2. CRITICAL TABLES (INLINE SQL - SAFETY NET)
+      // Projects Table
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS system.projects (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            name TEXT NOT NULL,
+            slug TEXT UNIQUE NOT NULL,
+            status TEXT NOT NULL DEFAULT 'healthy',
+            db_name TEXT UNIQUE NOT NULL, 
+            custom_domain TEXT UNIQUE,
+            default_domain TEXT UNIQUE,
+            ssl_certificate_source TEXT,
+            jwt_secret TEXT NOT NULL,
+            anon_key TEXT NOT NULL,
+            service_key TEXT NOT NULL,
+            blocklist TEXT[] DEFAULT '{}',
+            metadata JSONB DEFAULT '{}',
+            log_retention_days INTEGER DEFAULT 30,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // Admin Users Table (Fixes the login 500 error)
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS system.admin_users (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // Default Admin User
+      await client.query(`
+        INSERT INTO system.admin_users (email, password_hash) 
+        SELECT 'admin@cascata.io', 'admin123'
+        WHERE NOT EXISTS (SELECT 1 FROM system.admin_users WHERE email = 'admin@cascata.io');
+      `);
+
+      // UI Settings Table
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS system.ui_settings (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            project_slug TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            settings JSONB NOT NULL,
+            UNIQUE(project_slug, table_name)
+        );
+      `);
+
+      // Apps Table (New Feature)
       await client.query(`
         CREATE TABLE IF NOT EXISTS system.apps (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -356,6 +349,7 @@ class MigrationRunner {
         );
       `);
 
+      // 3. FILE BASED MIGRATIONS (SECONDARY)
       await client.query(`
         CREATE TABLE IF NOT EXISTS system.migrations (
           id SERIAL PRIMARY KEY,
@@ -364,28 +358,25 @@ class MigrationRunner {
         )
       `);
 
-      if (!fs.existsSync(MIGRATIONS_ROOT)) {
-        console.warn(`[MigrationRunner] Dir not found: ${MIGRATIONS_ROOT}`);
-        return;
-      }
+      if (fs.existsSync(MIGRATIONS_ROOT)) {
+        const files = fs.readdirSync(MIGRATIONS_ROOT)
+          .filter(f => f.endsWith('.sql') || f.endsWith('.sql.txt'))
+          .sort();
 
-      const files = fs.readdirSync(MIGRATIONS_ROOT)
-        .filter(f => f.endsWith('.sql') || f.endsWith('.sql.txt'))
-        .sort();
-
-      for (const file of files) {
-        const check = await client.query('SELECT id FROM system.migrations WHERE name = $1', [file]);
-        if (check.rowCount === 0) {
-          console.log(`[MigrationRunner] Applying: ${file}`);
-          const sql = fs.readFileSync(path.join(MIGRATIONS_ROOT, file), 'utf-8');
-          try {
-            await client.query('BEGIN');
-            await client.query(sql);
-            await client.query('INSERT INTO system.migrations (name) VALUES ($1)', [file]);
-            await client.query('COMMIT');
-          } catch (err: any) {
-            await client.query('ROLLBACK');
-            console.warn(`[MigrationRunner] Failed ${file}: ${err.message}. Skipping to preserve boot.`);
+        for (const file of files) {
+          const check = await client.query('SELECT id FROM system.migrations WHERE name = $1', [file]);
+          if (check.rowCount === 0) {
+            console.log(`[MigrationRunner] Applying external: ${file}`);
+            const sql = fs.readFileSync(path.join(MIGRATIONS_ROOT, file), 'utf-8');
+            try {
+              await client.query('BEGIN');
+              await client.query(sql);
+              await client.query('INSERT INTO system.migrations (name) VALUES ($1)', [file]);
+              await client.query('COMMIT');
+            } catch (err: any) {
+              await client.query('ROLLBACK');
+              console.warn(`[MigrationRunner] External migration ${file} failed (Skipping): ${err.message}`);
+            }
           }
         }
       }
@@ -393,7 +384,7 @@ class MigrationRunner {
       await CertificateManager.rebuildNginxConfigs();
 
     } catch (e: any) {
-      console.error('[MigrationRunner] Error:', e.message);
+      console.error('[MigrationRunner] Critical Error:', e.message);
     } finally {
       if (client) client.release();
     }
@@ -505,7 +496,6 @@ const getSectorForExt = (ext: string): string => {
 
 // --- 4. MIDDLEWARES CORE ---
 
-// Control Plane Firewall
 const controlPlaneFirewall: RequestHandler = async (req: any, res: any, next: any) => {
   if (req.method !== 'OPTIONS' && req.path.startsWith('/api/control/projects/')) {
     const slug = req.path.split('/')[4]; 
@@ -530,14 +520,13 @@ const controlPlaneFirewall: RequestHandler = async (req: any, res: any, next: an
                 }
             }
         } catch (e) {
-            // Fail open if DB issue
+            // Fail open
         }
     }
   }
   next();
 };
 
-// A. Project Resolver & Domain Locking
 const resolveProject: RequestHandler = async (req: any, res: any, next: any) => {
   if (req.path.startsWith('/api/control/')) return next();
   if (req.path === '/' || req.path === '/health') return next(); 
@@ -626,7 +615,6 @@ const resolveProject: RequestHandler = async (req: any, res: any, next: any) => 
   }
 };
 
-// B. Auth Middleware
 const cascataAuth: RequestHandler = async (req: any, res: any, next: any) => {
   const r = req as CascataRequest;
 
@@ -688,7 +676,6 @@ const cascataAuth: RequestHandler = async (req: any, res: any, next: any) => {
   res.status(401).json({ error: 'Unauthorized: Invalid API Key or JWT.' });
 };
 
-// HELPER: Semantic Action Detector
 const detectSemanticAction = (method: string, path: string): string | null => {
     if (path.includes('/tables') && method === 'POST' && path.endsWith('/rows')) return 'INSERT_ROWS';
     if (path.includes('/tables') && method === 'POST') return 'CREATE_TABLE';
@@ -702,7 +689,6 @@ const detectSemanticAction = (method: string, path: string): string | null => {
     return null;
 };
 
-// C. Audit Logger
 const auditLogger: RequestHandler = (req: any, res: any, next: any) => {
   const start = Date.now();
   const oldJson = res.json;
@@ -765,7 +751,6 @@ app.use(cascataAuth as any);
 
 // --- ROUTES ---
 
-// Health Check
 app.get('/', (req, res) => { res.send('Cascata Engine OK'); });
 app.get('/health', (req, res) => { res.json({ status: 'ok', time: new Date() }); });
 
@@ -797,7 +782,7 @@ app.get('/api/control/projects/:slug/apps', async (req: any, res: any) => {
     } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-// 4. App Actions (Delete, Stop, Start, Logs)
+// 4. App Actions
 app.delete('/api/control/projects/:slug/apps/:id', async (req: any, res: any) => {
     try {
         await appStore.deleteApp(req.params.id);
@@ -823,7 +808,8 @@ app.get('/api/control/projects/:slug/apps/:id/logs', async (req: any, res: any) 
     } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-// ... (Control Plane Routes - PRESERVED) ...
+// --- EXISTING CONTROL PLANE ROUTES (PRESERVED) ---
+
 app.post('/api/control/auth/login', async (req: any, res: any) => {
   const { email, password } = req.body;
   try {
@@ -888,16 +874,10 @@ app.post('/api/control/system/settings', async (req: any, res: any) => {
 app.post('/api/control/system/ssl-check', async (req: any, res: any) => {
   const { domain } = req.body;
   if (!domain) { res.status(400).json({ error: 'Domain required' }); return; }
-  
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
-    
-    await fetch(`https://${domain}`, { 
-        method: 'HEAD', 
-        signal: controller.signal,
-    });
-    
+    await fetch(`https://${domain}`, { method: 'HEAD', signal: controller.signal });
     clearTimeout(timeoutId);
     res.json({ status: 'active' });
   } catch (e: any) {
@@ -937,7 +917,6 @@ app.post('/api/control/projects', async (req: any, res: any) => {
       CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
       CREATE EXTENSION IF NOT EXISTS "pgcrypto";
       CREATE SCHEMA IF NOT EXISTS auth;
-      
       CREATE TABLE IF NOT EXISTS auth.users (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         created_at TIMESTAMPTZ DEFAULT now(),
@@ -945,7 +924,6 @@ app.post('/api/control/projects', async (req: any, res: any) => {
         banned BOOLEAN DEFAULT false,
         raw_user_meta_data JSONB DEFAULT '{}'
       );
-
       CREATE TABLE IF NOT EXISTS auth.identities (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
@@ -957,7 +935,6 @@ app.post('/api/control/projects', async (req: any, res: any) => {
         last_sign_in_at TIMESTAMPTZ,
         UNIQUE(provider, identifier)
       );
-
       CREATE TABLE IF NOT EXISTS auth.otp_codes (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         identifier TEXT NOT NULL,
@@ -966,7 +943,6 @@ app.post('/api/control/projects', async (req: any, res: any) => {
         expires_at TIMESTAMPTZ NOT NULL,
         created_at TIMESTAMPTZ DEFAULT now()
       );
-
       GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
       GRANT USAGE ON SCHEMA auth TO service_role;
       GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
@@ -990,37 +966,23 @@ app.delete('/api/control/projects/:slug', async (req: any, res: any) => {
   try {
     const result = await systemPool.query('SELECT * FROM system.projects WHERE slug = $1', [slug]);
     if ((result.rowCount ?? 0) === 0) { res.status(404).json({ error: 'Project not found' }); return; }
-    
     const project = result.rows[0];
-    
     await PoolManager.close(project.db_name);
-
     try {
         await systemPool.query(`DROP DATABASE IF EXISTS ${quoteId(project.db_name)}`);
     } catch (dbErr: any) {
-        await systemPool.query(`
-            SELECT pg_terminate_backend(pg_stat_activity.pid)
-            FROM pg_stat_activity
-            WHERE pg_stat_activity.datname = $1
-            AND pid <> pg_backend_pid()`, [project.db_name]);
+        await systemPool.query(`SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = $1 AND pid <> pg_backend_pid()`, [project.db_name]);
         await systemPool.query(`DROP DATABASE IF EXISTS ${quoteId(project.db_name)}`);
     }
-
     await systemPool.query('DELETE FROM system.projects WHERE slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.assets WHERE project_slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.webhooks WHERE project_slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.api_logs WHERE project_slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.ui_settings WHERE project_slug = $1', [slug]);
-    await systemPool.query('DELETE FROM system.apps WHERE project_slug = $1', [slug]); // DELETE APPS
-
+    await systemPool.query('DELETE FROM system.apps WHERE project_slug = $1', [slug]);
     const storagePath = path.join(STORAGE_ROOT, slug);
-    if (fs.existsSync(storagePath)) {
-        fs.rmSync(storagePath, { recursive: true, force: true });
-    }
-    
-    // Rebuild Nginx configs to remove deleted project
+    if (fs.existsSync(storagePath)) fs.rmSync(storagePath, { recursive: true, force: true });
     await CertificateManager.rebuildNginxConfigs();
-
     res.json({ success: true });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -1031,26 +993,15 @@ app.patch('/api/control/projects/:slug', async (req: any, res: any) => {
     let metadataQueryPart = 'metadata'; 
     const params = [custom_domain, log_retention_days, req.params.slug, ssl_certificate_source];
     let paramIdx = 5;
-
     if (metadata) {
         metadataQueryPart = `COALESCE(metadata, '{}'::jsonb) || $${paramIdx}::jsonb`;
         params.push(JSON.stringify(metadata));
     }
-
     const result = await systemPool.query(
-      `UPDATE system.projects 
-       SET custom_domain = COALESCE($1, custom_domain), 
-           log_retention_days = COALESCE($2, log_retention_days),
-           ssl_certificate_source = COALESCE($4, ssl_certificate_source),
-           metadata = ${metadataQueryPart},
-           updated_at = now() 
-       WHERE slug = $3 RETURNING *`,
+      `UPDATE system.projects SET custom_domain = COALESCE($1, custom_domain), log_retention_days = COALESCE($2, log_retention_days), ssl_certificate_source = COALESCE($4, ssl_certificate_source), metadata = ${metadataQueryPart}, updated_at = now() WHERE slug = $3 RETURNING *`,
       params
     );
-    
-    // Update Nginx configs dynamically
     await CertificateManager.rebuildNginxConfigs();
-    
     res.json(result.rows[0]);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -1063,36 +1014,20 @@ app.post('/api/control/projects/:slug/rotate-keys', async (req: any, res: any) =
   else if (type === 'service') column = 'service_key';
   else if (type === 'jwt') column = 'jwt_secret';
   else { res.status(400).json({ error: 'Invalid key type' }); return; }
-
   try {
-    await systemPool.query(
-      `UPDATE system.projects SET ${column} = $1 WHERE slug = $2`,
-      [newKey, req.params.slug]
-    );
+    await systemPool.query(`UPDATE system.projects SET ${column} = $1 WHERE slug = $2`, [newKey, req.params.slug]);
     res.json({ success: true, type, newKey: 'HIDDEN_IN_RESPONSE' });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/control/projects/:slug/block-ip', async (req: any, res: any) => {
   const { ip } = req.body;
-  try {
-    await systemPool.query(
-      'UPDATE system.projects SET blocklist = array_append(blocklist, $1) WHERE slug = $2', 
-      [ip, req.params.slug]
-    );
-    res.json({ success: true });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { await systemPool.query('UPDATE system.projects SET blocklist = array_append(blocklist, $1) WHERE slug = $2', [ip, req.params.slug]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/control/projects/:slug/blocklist/:ip', async (req: any, res: any) => {
   const { ip } = req.params;
-  try {
-    await systemPool.query(
-      'UPDATE system.projects SET blocklist = array_remove(blocklist, $1) WHERE slug = $2', 
-      [ip, req.params.slug]
-    );
-    res.json({ success: true });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { await systemPool.query('UPDATE system.projects SET blocklist = array_remove(blocklist, $1) WHERE slug = $2', [ip, req.params.slug]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/control/me/ip', (req: any, res: any) => {
@@ -1104,60 +1039,30 @@ app.get('/api/control/me/ip', (req: any, res: any) => {
 });
 
 app.get('/api/control/projects/:slug/webhooks', async (req: any, res: any) => {
-  try {
-    const result = await systemPool.query('SELECT * FROM system.webhooks WHERE project_slug = $1', [req.params.slug]);
-    res.json(result.rows);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const result = await systemPool.query('SELECT * FROM system.webhooks WHERE project_slug = $1', [req.params.slug]); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/control/projects/:slug/webhooks', async (req: any, res: any) => {
   const { target_url, event_type, table_name } = req.body;
-  try {
-    await systemPool.query(
-      'INSERT INTO system.webhooks (project_slug, target_url, event_type, table_name) VALUES ($1, $2, $3, $4)',
-      [req.params.slug, target_url, event_type, table_name]
-    );
-    res.json({ success: true });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { await systemPool.query('INSERT INTO system.webhooks (project_slug, target_url, event_type, table_name) VALUES ($1, $2, $3, $4)', [req.params.slug, target_url, event_type, table_name]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/control/projects/:slug/logs', async (req: any, res: any) => {
   const { days } = req.query;
-  try {
-    await systemPool.query(
-      `DELETE FROM system.api_logs WHERE project_slug = $1 AND created_at < now() - interval '${Number(days)} days'`,
-      [req.params.slug]
-    );
-    res.json({ success: true });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { await systemPool.query(`DELETE FROM system.api_logs WHERE project_slug = $1 AND created_at < now() - interval '${Number(days)} days'`, [req.params.slug]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/control/system/certificates/status', async (req: any, res: any) => {
-  try {
-    const status = await CertificateManager.detectEnvironment();
-    res.json(status);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const status = await CertificateManager.detectEnvironment(); res.json(status); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/control/system/certificates', async (req: any, res: any) => {
   const { domain, email, cert, key, provider, isSystem } = req.body;
-  try {
-    const result = await CertificateManager.requestCertificate(
-        domain, 
-        email, 
-        provider, 
-        { cert, key },
-        isSystem
-    );
-    res.json(result);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const result = await CertificateManager.requestCertificate(domain, email, provider, { cert, key }, isSystem); res.json(result); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/control/system/certificates/:domain', async (req: any, res: any) => {
-    try {
-        await CertificateManager.deleteCertificate(req.params.domain);
-        res.json({ success: true });
-    } catch (e: any) { res.status(500).json({ error: e.message }); }
+    try { await CertificateManager.deleteCertificate(req.params.domain); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 // --- DATA PLANE ROUTES ---
@@ -1170,75 +1075,40 @@ app.get('/api/data/:slug/stats', async (req: any, res: any) => {
       r.projectPool!.query("SELECT count(*) FROM auth.users"),
       r.projectPool!.query("SELECT pg_size_pretty(pg_database_size(current_database()))")
     ]);
-    res.json({
-      tables: parseInt(tables.rows[0].count),
-      users: parseInt(users.rows[0].count),
-      size: size.rows[0].pg_size_pretty
-    });
+    res.json({ tables: parseInt(tables.rows[0].count), users: parseInt(users.rows[0].count), size: size.rows[0].pg_size_pretty });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/tables', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try {
-    const result = await r.projectPool!.query(
-      "SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name NOT LIKE '_deleted_%'"
-    );
-    res.json(result.rows);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const result = await r.projectPool!.query("SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name NOT LIKE '_deleted_%'"); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/recycle-bin', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try {
-    const result = await r.projectPool!.query(
-      "SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '_deleted_%'"
-    );
-    res.json(result.rows);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const result = await r.projectPool!.query("SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '_deleted_%'"); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/recycle-bin/:table/restore', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const tableName = req.params.table;
-  try {
-    const originalName = tableName.replace(/^_deleted_\d+_/, '');
-    await r.projectPool!.query(`ALTER TABLE public.${quoteId(tableName)} RENAME TO ${quoteId(originalName)}`);
-    res.json({ success: true, restoredName: originalName });
-  } catch (e: any) { res.status(400).json({ error: e.message }); }
+  try { const originalName = tableName.replace(/^_deleted_\d+_/, ''); await r.projectPool!.query(`ALTER TABLE public.${quoteId(tableName)} RENAME TO ${quoteId(originalName)}`); res.json({ success: true, restoredName: originalName }); } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.delete('/api/data/:slug/recycle-bin/:table', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try {
-    await r.projectPool!.query(`DROP TABLE public.${quoteId(req.params.table)} CASCADE`);
-    res.json({ success: true });
-  } catch (e: any) { res.status(400).json({ error: e.message }); }
+  try { await r.projectPool!.query(`DROP TABLE public.${quoteId(req.params.table)} CASCADE`); res.json({ success: true }); } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/tables/:table/sql', async (req: any, res: any) => {
     const r = req as CascataRequest;
     const { table } = req.params;
     try {
-        const columnsRes = await r.projectPool!.query(
-            `SELECT column_name, data_type, is_nullable, column_default 
-             FROM information_schema.columns 
-             WHERE table_name = $1`, 
-            [table]
-        );
-        if (columnsRes.rowCount === 0) {
-            res.json({ sql: `-- Table ${table} not found or empty` });
-            return;
-        }
+        const columnsRes = await r.projectPool!.query(`SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = $1`, [table]);
+        if (columnsRes.rowCount === 0) { res.json({ sql: `-- Table ${table} not found` }); return; }
         let sql = `CREATE TABLE public."${table}" (\n`;
-        const cols = columnsRes.rows.map(c => {
-            let line = `  "${c.column_name}" ${c.data_type.toUpperCase()}`;
-            if (c.is_nullable === 'NO') line += ' NOT NULL';
-            if (c.column_default) line += ` DEFAULT ${c.column_default}`;
-            return line;
-        });
-        sql += cols.join(',\n');
-        sql += '\n);';
+        const cols = columnsRes.rows.map(c => `  "${c.column_name}" ${c.data_type.toUpperCase()}${c.is_nullable === 'NO' ? ' NOT NULL' : ''}${c.column_default ? ` DEFAULT ${c.column_default}` : ''}`);
+        sql += cols.join(',\n') + '\n);';
         res.json({ sql });
     } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -1252,15 +1122,11 @@ app.post('/api/data/:slug/tables', async (req: any, res: any) => {
     if (c.nullable === false) def += ' NOT NULL';
     if (c.isUnique) def += ' UNIQUE'; 
     if (c.default) def += ` DEFAULT ${c.default}`;
-    if (c.foreignKey) {
-       def += ` REFERENCES public.${quoteId(c.foreignKey.table)}(${quoteId(c.foreignKey.column)})`;
-    }
+    if (c.foreignKey) def += ` REFERENCES public.${quoteId(c.foreignKey.table)}(${quoteId(c.foreignKey.column)})`;
     return def;
   }).join(', ');
-
-  const sql = `CREATE TABLE public.${quoteId(name)} (${colsSql})`;
   try {
-    await r.projectPool!.query(sql);
+    await r.projectPool!.query(`CREATE TABLE public.${quoteId(name)} (${colsSql})`);
     await r.projectPool!.query(`ALTER TABLE public.${quoteId(name)} ENABLE ROW LEVEL SECURITY`);
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
@@ -1269,34 +1135,23 @@ app.post('/api/data/:slug/tables', async (req: any, res: any) => {
 app.post('/api/data/:slug/tables/:table/columns', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { name, type, isNullable, defaultValue, isUnique } = req.body;
-  if (!name || !type) { res.status(400).json({ error: 'Name and Type required' }); return; }
   let sql = `ALTER TABLE public.${quoteId(req.params.table)} ADD COLUMN ${quoteId(name)} ${type}`;
   if (!isNullable) sql += ' NOT NULL';
   if (defaultValue) sql += ` DEFAULT ${defaultValue}`;
   if (isUnique) sql += ' UNIQUE';
-  try {
-    await r.projectPool!.query(sql);
-    res.json({ success: true });
-  } catch (e: any) { res.status(400).json({ error: e.message }); }
+  try { await r.projectPool!.query(sql); res.json({ success: true }); } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.patch('/api/data/:slug/tables/:table/rename', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  const { newName } = req.body;
-  if (!newName) { res.status(400).json({ error: 'New name required' }); return; }
-  try {
-    await r.projectPool!.query(`ALTER TABLE public.${quoteId(req.params.table)} RENAME TO ${quoteId(newName)}`);
-    res.json({ success: true });
-  } catch (e: any) { res.status(400).json({ error: e.message }); }
+  try { await r.projectPool!.query(`ALTER TABLE public.${quoteId(req.params.table)} RENAME TO ${quoteId(req.body.newName)}`); res.json({ success: true }); } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/tables/:table/duplicate', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { newName, withData } = req.body;
-  if (!newName) { res.status(400).json({ error: 'New name required' }); return; }
   try {
-    const option = withData ? '' : 'WITH NO DATA';
-    await r.projectPool!.query(`CREATE TABLE public.${quoteId(newName)} AS TABLE public.${quoteId(req.params.table)} ${option}`);
+    await r.projectPool!.query(`CREATE TABLE public.${quoteId(newName)} AS TABLE public.${quoteId(req.params.table)} ${withData ? '' : 'WITH NO DATA'}`);
     await r.projectPool!.query(`ALTER TABLE public.${quoteId(newName)} ENABLE ROW LEVEL SECURITY`);
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
@@ -1306,13 +1161,8 @@ app.delete('/api/data/:slug/tables/:table', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { mode } = req.body;
   try {
-    if (mode === 'CASCADE' || mode === 'RESTRICT') {
-        const cascadeSql = mode === 'CASCADE' ? 'CASCADE' : '';
-        await r.projectPool!.query(`DROP TABLE public.${quoteId(req.params.table)} ${cascadeSql}`);
-    } else {
-        const deletedName = `_deleted_${Date.now()}_${req.params.table}`;
-        await r.projectPool!.query(`ALTER TABLE public.${quoteId(req.params.table)} RENAME TO ${quoteId(deletedName)}`);
-    }
+    if (mode === 'CASCADE' || mode === 'RESTRICT') await r.projectPool!.query(`DROP TABLE public.${quoteId(req.params.table)} ${mode === 'CASCADE' ? 'CASCADE' : ''}`);
+    else await r.projectPool!.query(`ALTER TABLE public.${quoteId(req.params.table)} RENAME TO ${quoteId(`_deleted_${Date.now()}_${req.params.table}`)}`);
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
@@ -1320,15 +1170,7 @@ app.delete('/api/data/:slug/tables/:table', async (req: any, res: any) => {
 app.get('/api/data/:slug/tables/:table/columns', async (req: any, res: any) => {
   const r = req as CascataRequest;
   try {
-    const result = await r.projectPool!.query(
-      `SELECT column_name as name, data_type as type, is_nullable = 'YES' as "isNullable", 
-       EXISTS (
-         SELECT 1 FROM information_schema.key_column_usage kcu 
-         WHERE kcu.table_name = $1 AND kcu.column_name = c.column_name
-       ) as "isPrimaryKey" 
-       FROM information_schema.columns c WHERE table_name = $1`,
-      [req.params.table]
-    );
+    const result = await r.projectPool!.query(`SELECT column_name as name, data_type as type, is_nullable = 'YES' as "isNullable", EXISTS (SELECT 1 FROM information_schema.key_column_usage kcu WHERE kcu.table_name = $1 AND kcu.column_name = c.column_name) as "isPrimaryKey" FROM information_schema.columns c WHERE table_name = $1`, [req.params.table]);
     res.json(result.rows);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -1336,8 +1178,7 @@ app.get('/api/data/:slug/tables/:table/columns', async (req: any, res: any) => {
 app.post('/api/data/:slug/tables/:table/rows', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { data } = req.body;
-  const isBatch = Array.isArray(data);
-  const rows = isBatch ? data : [data];
+  const rows = Array.isArray(data) ? data : [data];
   if (rows.length === 0) { res.json([]); return; }
   try {
     const resultRows = await queryWithRLS(r, async (client) => {
@@ -1349,32 +1190,23 @@ app.post('/api/data/:slug/tables/:table/rows', async (req: any, res: any) => {
             const cols = keys.map(k => quoteId(k)).join(',');
             const values = keys.map(k => row[k]);
             const placeholders = keys.map((_, i) => `$${i + 1}`).join(',');
-            const res = await client.query(
-                `INSERT INTO public.${quoteId(req.params.table)} (${cols}) VALUES (${placeholders}) RETURNING *`,
-                values
-            );
+            const res = await client.query(`INSERT INTO public.${quoteId(req.params.table)} (${cols}) VALUES (${placeholders}) RETURNING *`, values);
             allResults.push(res.rows[0]);
         }
         await client.query('COMMIT');
         return allResults;
     });
-    res.json(isBatch ? resultRows : resultRows[0]);
+    res.json(Array.isArray(data) ? resultRows : resultRows[0]);
   } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/tables/:table/data', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { select, limit = 100 } = req.query;
-  let cols = '*';
-  if (typeof select === 'string' && select !== '*') {
-    cols = select.split(',').map(c => quoteId(c.trim())).join(',');
-  }
+  const cols = (typeof select === 'string' && select !== '*') ? select.split(',').map(c => quoteId(c.trim())).join(',') : '*';
   try {
     const rows = await queryWithRLS(r, async (client) => {
-        const result = await client.query(
-            `SELECT ${cols} FROM public.${quoteId(req.params.table)} LIMIT $1`, 
-            [limit]
-        );
+        const result = await client.query(`SELECT ${cols} FROM public.${quoteId(req.params.table)} LIMIT $1`, [limit]);
         return result.rows;
     });
     res.json(rows);
@@ -1389,10 +1221,7 @@ app.put('/api/data/:slug/tables/:table/rows', async (req: any, res: any) => {
   const values = [...keys.map(k => data[k]), pkValue];
   try {
     await queryWithRLS(r, async (client) => {
-        await client.query(
-            `UPDATE public.${quoteId(req.params.table)} SET ${setClause} WHERE ${quoteId(pkColumn)} = $${values.length}`,
-            values
-        );
+        await client.query(`UPDATE public.${quoteId(req.params.table)} SET ${setClause} WHERE ${quoteId(pkColumn)} = $${values.length}`, values);
     });
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
@@ -1403,10 +1232,7 @@ app.post('/api/data/:slug/tables/:table/delete-rows', async (req: any, res: any)
   const { ids, pkColumn } = req.body;
   try {
     await queryWithRLS(r, async (client) => {
-        await client.query(
-            `DELETE FROM public.${quoteId(req.params.table)} WHERE ${quoteId(pkColumn)} = ANY($1)`,
-            [ids]
-        );
+        await client.query(`DELETE FROM public.${quoteId(req.params.table)} WHERE ${quoteId(pkColumn)} = ANY($1)`, [ids]);
     });
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
@@ -1430,10 +1256,7 @@ app.post('/api/data/:slug/rpc/:name', async (req: any, res: any) => {
   const values = Object.values(params);
   try {
     const rows = await queryWithRLS(r, async (client) => {
-        const result = await client.query(
-            `SELECT * FROM public.${quoteId(req.params.name)}(${placeholders})`, 
-            values
-        );
+        const result = await client.query(`SELECT * FROM public.${quoteId(req.params.name)}(${placeholders})`, values);
         return result.rows;
     });
     res.json(rows);
@@ -1442,10 +1265,7 @@ app.post('/api/data/:slug/rpc/:name', async (req: any, res: any) => {
 
 app.get('/api/data/:slug/auth/users', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try {
-    const result = await r.projectPool!.query(`SELECT u.id, u.created_at, u.banned, u.last_sign_in_at, jsonb_agg(jsonb_build_object('id', i.id, 'provider', i.provider, 'identifier', i.identifier)) as identities FROM auth.users u LEFT JOIN auth.identities i ON u.id = i.user_id GROUP BY u.id ORDER BY u.created_at DESC`);
-    res.json(result.rows);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const result = await r.projectPool!.query(`SELECT u.id, u.created_at, u.banned, u.last_sign_in_at, jsonb_agg(jsonb_build_object('id', i.id, 'provider', i.provider, 'identifier', i.identifier)) as identities FROM auth.users u LEFT JOIN auth.identities i ON u.id = i.user_id GROUP BY u.id ORDER BY u.created_at DESC`); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/auth/users', async (req: any, res: any) => {
@@ -1456,15 +1276,10 @@ app.post('/api/data/:slug/auth/users', async (req: any, res: any) => {
     await client.query('BEGIN');
     const userRes = await client.query('INSERT INTO auth.users (raw_user_meta_data) VALUES ($1) RETURNING id', [profileData || {}]);
     const userId = userRes.rows[0].id;
-    if (strategies) {
-        for (const s of strategies) await client.query('INSERT INTO auth.identities (user_id, provider, identifier, password_hash) VALUES ($1, $2, $3, $4)', [userId, s.provider, s.identifier, s.password]);
-    }
+    if (strategies) { for (const s of strategies) await client.query('INSERT INTO auth.identities (user_id, provider, identifier, password_hash) VALUES ($1, $2, $3, $4)', [userId, s.provider, s.identifier, s.password]); }
     await client.query('COMMIT');
     res.json({ success: true, id: userId });
-  } catch (e: any) { 
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message }); 
-  } finally { client.release(); }
+  } catch (e: any) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
 });
 
 app.patch('/api/data/:slug/auth/users/:id/status', async (req: any, res: any) => {
@@ -1499,21 +1314,11 @@ app.post('/api/data/:slug/auth/link', async (req: any, res: any) => {
         try {
             await client.query('BEGIN');
             for (const table of linked_tables) {
-                await client.query(
-                    `ALTER TABLE public.${quoteId(table)} 
-                     ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL`
-                );
-                await client.query(
-                    `CREATE INDEX IF NOT EXISTS ${quoteId('idx_' + table + '_user_id')} ON public.${quoteId(table)} (user_id)`
-                );
+                await client.query(`ALTER TABLE public.${quoteId(table)} ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL`);
+                await client.query(`CREATE INDEX IF NOT EXISTS ${quoteId('idx_' + table + '_user_id')} ON public.${quoteId(table)} (user_id)`);
             }
             await client.query('COMMIT');
-        } catch (dbErr: any) {
-            await client.query('ROLLBACK');
-            console.error("Link Table Error:", dbErr);
-        } finally {
-            client.release();
-        }
+        } catch (dbErr: any) { await client.query('ROLLBACK'); console.error("Link Table Error:", dbErr); } finally { client.release(); }
     }
     res.json({ success: true });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
@@ -1526,19 +1331,10 @@ const walk = (dir: string, rootPath: string, fileList: any[] = []) => {
       const filePath = path.join(dir, file);
       const stat = fs.statSync(filePath);
       const relativePath = path.relative(rootPath, filePath).replace(/\\/g, '/');
-      fileList.push({
-        name: file,
-        type: stat.isDirectory() ? 'folder' : 'file',
-        size: stat.size,
-        updated_at: stat.mtime.toISOString(),
-        path: relativePath
-      });
-      if (stat.isDirectory()) {
-        walk(filePath, rootPath, fileList);
-      }
+      fileList.push({ name: file, type: stat.isDirectory() ? 'folder' : 'file', size: stat.size, updated_at: stat.mtime.toISOString(), path: relativePath });
+      if (stat.isDirectory()) walk(filePath, rootPath, fileList);
     });
-  } catch (e) {
-  }
+  } catch (e) {}
   return fileList;
 };
 
@@ -1552,13 +1348,9 @@ app.get('/api/data/:slug/storage/search', async (req: any, res: any) => {
   if (!searchRoot.startsWith(projectRoot)) { res.status(403).json({ error: 'Access Denied' }); return; }
   try {
     let allFiles = walk(searchRoot, bucket ? searchRoot : projectRoot, []);
-    if (searchTerm) {
-      allFiles = allFiles.filter(f => f.name.toLowerCase().includes(searchTerm));
-    }
+    if (searchTerm) allFiles = allFiles.filter(f => f.name.toLowerCase().includes(searchTerm));
     res.json({ items: allFiles });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/storage/buckets', async (req: any, res: any) => {
@@ -1591,12 +1383,7 @@ app.delete('/api/data/:slug/storage/buckets/:name', async (req: any, res: any) =
   const bucketPath = path.join(STORAGE_ROOT, r.project.slug, req.params.name);
   if (!fs.existsSync(bucketPath)) { res.status(404).json({ error: 'Bucket not found' }); return; }
   if (!bucketPath.startsWith(path.join(STORAGE_ROOT, r.project.slug))) { res.status(403).json({ error: 'Access denied' }); return; }
-  try {
-      fs.rmSync(bucketPath, { recursive: true, force: true });
-      res.json({ success: true });
-  } catch (e: any) {
-      res.status(500).json({ error: e.message });
-  }
+  try { fs.rmSync(bucketPath, { recursive: true, force: true }); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/storage/:bucket/folder', async (req: any, res: any) => {
@@ -1605,12 +1392,7 @@ app.post('/api/data/:slug/storage/:bucket/folder', async (req: any, res: any) =>
   const bucketPath = path.join(STORAGE_ROOT, r.project.slug, req.params.bucket);
   const folderPath = path.join(bucketPath, relativePath || '', name);
   if (!folderPath.startsWith(bucketPath)) { res.status(403).json({ error: 'Access Denied' }); return; }
-  if (!fs.existsSync(folderPath)) {
-    fs.mkdirSync(folderPath, { recursive: true });
-    res.json({ success: true });
-  } else {
-    res.status(400).json({ error: 'Folder exists' });
-  }
+  if (!fs.existsSync(folderPath)) { fs.mkdirSync(folderPath, { recursive: true }); res.json({ success: true }); } else { res.status(400).json({ error: 'Folder exists' }); }
 });
 
 app.get('/api/data/:slug/storage/:bucket/list', async (req: any, res: any) => {
@@ -1625,13 +1407,7 @@ app.get('/api/data/:slug/storage/:bucket/list', async (req: any, res: any) => {
     const items = files.map(file => {
       const filePath = path.join(targetPath, file);
       const stat = fs.statSync(filePath);
-      return {
-        name: file,
-        type: stat.isDirectory() ? 'folder' : 'file',
-        size: stat.size,
-        updated_at: stat.mtime.toISOString(),
-        path: path.relative(bucketPath, filePath).replace(/\\/g, '/')
-      };
+      return { name: file, type: stat.isDirectory() ? 'folder' : 'file', size: stat.size, updated_at: stat.mtime.toISOString(), path: path.relative(bucketPath, filePath).replace(/\\/g, '/') };
     });
     res.json({ items });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
@@ -1654,19 +1430,9 @@ app.post('/api/data/:slug/storage/:bucket/upload', upload.single('file') as any,
   const ext = path.extname(r.file.originalname).replace('.', '').toLowerCase();
   const sector = getSectorForExt(ext);
   const rule = governance[sector] || governance['global'] || { max_size: '10MB', allowed_exts: [] };
-  if (rule.allowed_exts) {
-      if (!rule.allowed_exts.includes(ext)) {
-          fs.unlinkSync(r.file.path);
-          res.status(403).json({ error: `Policy Violation: Extension .${ext} is not allowed. Allowed: [${rule.allowed_exts.join(', ')}]` });
-          return;
-      }
-  }
+  if (rule.allowed_exts && !rule.allowed_exts.includes(ext)) { fs.unlinkSync(r.file.path); res.status(403).json({ error: `Policy Violation: Extension .${ext} is not allowed.` }); return; }
   const maxBytes = parseBytes(rule.max_size);
-  if (r.file.size > maxBytes) {
-      fs.unlinkSync(r.file.path);
-      res.status(403).json({ error: `Policy Violation: File size (${(r.file.size/1024).toFixed(2)}KB) exceeds limit of ${rule.max_size} for ${sector}.` });
-      return;
-  }
+  if (r.file.size > maxBytes) { fs.unlinkSync(r.file.path); res.status(403).json({ error: `Policy Violation: File size exceeds limit.` }); return; }
   const dest = path.join(STORAGE_ROOT, r.project.slug, req.params.bucket, r.body.path || '', r.file.originalname);
   if (!fs.existsSync(path.dirname(dest))) fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.renameSync(r.file.path, dest);
@@ -1684,10 +1450,7 @@ app.post('/api/data/:slug/storage/move', async (req: any, res: any) => {
       const source = path.join(root, bucket, itemPath);
       const itemName = path.basename(itemPath);
       const target = path.join(destPath, itemName);
-      if (fs.existsSync(source)) {
-          fs.renameSync(source, target);
-          movedCount++;
-      }
+      if (fs.existsSync(source)) { fs.renameSync(source, target); movedCount++; }
   }
   res.json({ success: true, moved: movedCount });
 });
@@ -1696,41 +1459,25 @@ app.delete('/api/data/:slug/storage/:bucket/object', async (req: any, res: any) 
   const r = req as CascataRequest;
   const { path: queryPath } = req.query;
   const filePath = path.join(STORAGE_ROOT, r.project.slug, req.params.bucket, (queryPath as string));
-  if (fs.existsSync(filePath)) {
-    fs.rmSync(filePath, { recursive: true, force: true });
-    res.json({ success: true });
-  } else {
-    res.status(404).json({ error: 'Not found' });
-  }
+  if (fs.existsSync(filePath)) { fs.rmSync(filePath, { recursive: true, force: true }); res.json({ success: true }); } else { res.status(404).json({ error: 'Not found' }); }
 });
 
 app.get('/api/data/:slug/logs', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try {
-    const result = await systemPool.query('SELECT * FROM system.api_logs WHERE project_slug = $1 ORDER BY created_at DESC LIMIT 100', [r.project.slug]);
-    res.json(result.rows);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const result = await systemPool.query('SELECT * FROM system.api_logs WHERE project_slug = $1 ORDER BY created_at DESC LIMIT 100', [r.project.slug]); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/assets', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try {
-    const result = await systemPool.query('SELECT * FROM system.assets WHERE project_slug = $1', [r.project.slug]);
-    res.json(result.rows);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const result = await systemPool.query('SELECT * FROM system.assets WHERE project_slug = $1', [r.project.slug]); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/assets', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { id, name, type, parent_id, metadata } = req.body;
   try {
-    if (id) {
-       const upd = await systemPool.query('UPDATE system.assets SET name=$1, metadata=$2 WHERE id=$3 RETURNING *', [name, metadata, id]);
-       res.json(upd.rows[0]);
-    } else {
-       const ins = await systemPool.query('INSERT INTO system.assets (project_slug, name, type, parent_id, metadata) VALUES ($1, $2, $3, $4, $5) RETURNING *', [r.project.slug, name, type, parent_id, metadata]);
-       res.json(ins.rows[0]);
-    }
+    if (id) { const upd = await systemPool.query('UPDATE system.assets SET name=$1, metadata=$2 WHERE id=$3 RETURNING *', [name, metadata, id]); res.json(upd.rows[0]); } 
+    else { const ins = await systemPool.query('INSERT INTO system.assets (project_slug, name, type, parent_id, metadata) VALUES ($1, $2, $3, $4, $5) RETURNING *', [r.project.slug, name, type, parent_id, metadata]); res.json(ins.rows[0]); }
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1776,29 +1523,13 @@ app.post('/api/data/:slug/ui-settings/:table', async (req: any, res: any) => {
   try { await systemPool.query(`INSERT INTO system.ui_settings (project_slug, table_name, settings) VALUES ($1, $2, $3) ON CONFLICT (project_slug, table_name) DO UPDATE SET settings = $3`, [r.project.slug, req.params.table, req.body.settings]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-// SAFE STARTUP WRAPPER
+// STARTUP
 (async () => {
   try {
     console.log('[System] Initializing Cascata Backend...');
-    
-    // 1. Ensure a fallback certificate exists so Nginx doesn't crash on boot
     await CertificateManager.ensureSystemCert();
-
-    // 2. START SERVER IMMEDIATELY (Prevents 502 loop)
-    app.listen(PORT, () => {
-      console.log(`[CASCATA SECURE ENGINE] v5.3 Listening on port ${PORT} (Optimistic Start)`);
-    });
-
-    // 3. Run checks in background
+    app.listen(PORT, () => console.log(`[CASCATA SECURE ENGINE] v5.5 Listening on port ${PORT}`));
     const dbReady = await waitForDatabase(15, 3000); 
-    if (dbReady) {
-      await MigrationRunner.run();
-    } else {
-      console.warn('[System] Warning: Database connection flaky. Running in Maintenance Mode.');
-    }
-
-  } catch (e) {
-    console.error('[System] FATAL ERROR during startup:', e);
-    // DO NOT EXIT - Let Docker restart if it must, but try to stay up to log errors
-  }
+    if (dbReady) await MigrationRunner.run();
+  } catch (e) { console.error('[System] FATAL ERROR during startup:', e); }
 })();

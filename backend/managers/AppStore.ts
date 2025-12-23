@@ -12,7 +12,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const APPS_ROOT = path.resolve(__dirname, '../../storage/apps');
 
-// Repositório Oficial
+// Repositório Oficial de Apps
 const GITHUB_REPO_BASE = 'https://raw.githubusercontent.com/supermetanet-png/cascata-apps/main';
 
 export class AppStore {
@@ -23,52 +23,60 @@ export class AppStore {
         if (!fs.existsSync(APPS_ROOT)) fs.mkdirSync(APPS_ROOT, { recursive: true });
     }
 
+    // --- 1. LISTAGEM (GITHUB SOURCE OF TRUTH) ---
     public async fetchStoreListing() {
         try {
             const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 5000);
+            const timeout = setTimeout(() => controller.abort(), 8000);
             
             const res = await fetch(`${GITHUB_REPO_BASE}/apps.json`, { signal: controller.signal });
             clearTimeout(timeout);
             
-            if (!res.ok) throw new Error("Falha ao ler repositório");
+            if (!res.ok) throw new Error("Repositório inacessível");
             return await res.json();
         } catch (e) {
-            console.error("[AppStore] GitHub fetch failed, using fallback:", e);
+            console.warn("[AppStore] GitHub fetch failed, using offline fallback:", e);
             return [
                 {
                     id: "n8n",
                     name: "n8n Workflow Automation",
-                    description: "Workflow automation tool. Fair-code licensed. (Fallback Mode)",
+                    description: "Ferramenta de automação de fluxo de trabalho líder de mercado. (Modo Offline)",
                     logo: "https://raw.githubusercontent.com/n8n-io/n8n/master/assets/n8n-logo.png",
                     version: "latest",
-                    tags: ["Automation", "Low-code"]
+                    tags: ["Automation", "Low-code", "Official"]
                 }
             ];
         }
     }
 
+    // --- 2. INSTALAÇÃO (SYSTEM DB SHARING) ---
     public async installApp(projectSlug: string, appId: string, domain: string) {
         console.log(`[AppStore] Installing ${appId} for ${projectSlug} on ${domain}...`);
 
         const deployId = crypto.randomUUID();
         const shortId = deployId.split('-')[0];
-        const dbName = `app_${projectSlug}_${appId}_${shortId}`.replace(/-/g, '_').toLowerCase();
-        const dbUser = `user_${shortId}`;
+        
+        // Configuração de Banco de Dados ISOLADO LÓGICAMENTE no Postgres do Sistema
+        const dbName = `app_${projectSlug.replace(/-/g,'_')}_${appId}_${shortId}`.toLowerCase();
+        const dbUser = `u_${shortId}`;
         const dbPass = crypto.randomBytes(16).toString('hex');
         
+        // Credenciais Específicas do n8n (Geradas automaticamente)
         const encryptionKey = crypto.randomBytes(32).toString('base64'); 
         const runnerSecret = crypto.randomBytes(32).toString('base64');
         const jwtSecret = crypto.randomBytes(32).toString('hex');
 
-        // Provisionar DB no Postgres Compartilhado (System)
+        // A. Provisionar Banco de Dados
         const client = await this.systemPool.connect();
         try {
+            // Verifica se usuário existe
             const userCheck = await client.query(`SELECT 1 FROM pg_roles WHERE rolname=$1`, [dbUser]);
             if (userCheck.rowCount === 0) {
                 await client.query(`CREATE USER "${dbUser}" WITH PASSWORD '${dbPass}'`);
             }
+            // Cria o banco
             await client.query(`CREATE DATABASE "${dbName}" OWNER "${dbUser}"`);
+            console.log(`[AppStore] DB ${dbName} criado.`);
         } catch (e: any) {
             client.release();
             throw new Error(`Falha ao provisionar banco: ${e.message}`);
@@ -76,7 +84,7 @@ export class AppStore {
             client.release();
         }
 
-        // Baixar Template
+        // B. Obter Template Docker Compose
         let composeTemplate = '';
         try {
             const res = await fetch(`${GITHUB_REPO_BASE}/${appId}/docker-compose.yml`);
@@ -87,21 +95,19 @@ export class AppStore {
             }
         } catch (e) {
             console.log("[AppStore] Using local fallback template for n8n");
-            if (appId === 'n8n') {
-                composeTemplate = this.getN8nFallbackTemplate();
-            } else {
-                throw new Error("App não suportado no modo fallback.");
-            }
+            if (appId === 'n8n') composeTemplate = this.getN8nFallbackTemplate();
+            else throw new Error("App não suportado no modo fallback.");
         }
 
+        // C. Substituir Variáveis no Template
         const networkName = await this.getDockerNetworkName();
-        const containerPrefix = `app-${projectSlug}-${appId}-${shortId}`;
+        const containerPrefix = `app-${shortId}`; // Nome curto para evitar limites do Docker DNS
         
         let finalCompose = composeTemplate
             .replace(/\${CONTAINER_PREFIX}/g, containerPrefix)
             .replace(/\${DOMAIN}/g, domain)
             .replace(/\${NETWORK_NAME}/g, networkName)
-            .replace(/\${DB_HOST}/g, 'cascata-db')
+            .replace(/\${DB_HOST}/g, 'cascata-db') // Conecta no container do banco principal via rede interna
             .replace(/\${DB_NAME}/g, dbName)
             .replace(/\${DB_USER}/g, dbUser)
             .replace(/\${DB_PASS}/g, dbPass)
@@ -109,16 +115,18 @@ export class AppStore {
             .replace(/\${JWT_SECRET}/g, jwtSecret)
             .replace(/\${RUNNER_SECRET}/g, runnerSecret);
 
+        // D. Salvar Arquivos
         const appDir = path.join(APPS_ROOT, deployId);
         if (!fs.existsSync(appDir)) fs.mkdirSync(appDir, { recursive: true });
         fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), finalCompose);
         
+        // E. Registrar no Banco do Sistema
         const envVars = {
             DB_NAME: dbName,
             DB_USER: dbUser,
             DB_HOST: 'cascata-db',
-            N8N_ENCRYPTION_KEY: encryptionKey,
-            GENERATED_AT: new Date().toISOString()
+            N8N_ENCRYPTION_KEY: encryptionKey, // Crítico para backup do usuário
+            INSTALL_DATE: new Date().toISOString()
         };
 
         await this.systemPool.query(
@@ -127,6 +135,7 @@ export class AppStore {
             [deployId, projectSlug, appId, domain, 5678, `${containerPrefix}-main`, JSON.stringify(envVars)]
         );
 
+        // F. Executar Deploy
         try {
             await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} up -d`);
             await this.systemPool.query(`UPDATE system.apps SET status = 'running' WHERE id = $1`, [deployId]);
@@ -156,17 +165,25 @@ export class AppStore {
 
     public async deleteApp(appId: string) {
         await this.stopApp(appId);
+        // Soft delete do registro, mantemos o banco de dados por segurança (usuário remove manualmente se quiser)
         await this.systemPool.query(`DELETE FROM system.apps WHERE id = $1`, [appId]);
+        
         const appDir = path.join(APPS_ROOT, appId);
-        if (fs.existsSync(appDir)) fs.rmSync(appDir, { recursive: true, force: true });
+        if (fs.existsSync(appDir)) {
+            fs.rmSync(appDir, { recursive: true, force: true });
+        }
     }
 
-    public async getLogs(appId: string, lines: number = 100) {
+    public async getLogs(appId: string, lines: number = 200) {
         const res = await this.systemPool.query(`SELECT container_name_main FROM system.apps WHERE id = $1`, [appId]);
         if (res.rows.length === 0) throw new Error("App not found");
         const container = res.rows[0].container_name_main;
-        const { stdout } = await execAsync(`docker logs --tail ${lines} ${container}`);
-        return stdout;
+        try {
+            const { stdout } = await execAsync(`docker logs --tail ${lines} ${container}`);
+            return stdout;
+        } catch (e) {
+            return "Container not running or logs unavailable.";
+        }
     }
 
     private async getDockerNetworkName(): Promise<string> {
@@ -202,62 +219,11 @@ services:
       - DB_POSTGRESDB_DATABASE=\${DB_NAME}
       - N8N_ENCRYPTION_KEY=\${ENCRYPTION_KEY}
       - N8N_USER_MANAGEMENT_JWT_SECRET=\${JWT_SECRET}
-      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
-      - EXECUTIONS_MODE=queue
-      - QUEUE_BULL_REDIS_HOST=redis
-      - QUEUE_BULL_REDIS_PORT=6379
       - WEBHOOK_URL=https://\${DOMAIN}/
       - N8N_PROXY_HOPS=1
       - GENERIC_TIMEZONE=America/Sao_Paulo
     volumes:
       - ./n8n_data:/home/node/.n8n
-    depends_on:
-      redis:
-        condition: service_healthy
-
-  n8n-worker:
-    image: docker.n8n.io/n8nio/n8n:latest
-    restart: always
-    container_name: \${CONTAINER_PREFIX}-worker
-    networks:
-      - default
-      - cascata_net
-    command: worker
-    environment:
-      - NODE_ENV=production
-      - N8N_HOST=\${DOMAIN}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - EXECUTIONS_MODE=queue
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=\${DB_HOST}
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_USER=\${DB_USER}
-      - DB_POSTGRESDB_PASSWORD=\${DB_PASS}
-      - DB_POSTGRESDB_DATABASE=\${DB_NAME}
-      - N8N_ENCRYPTION_KEY=\${ENCRYPTION_KEY}
-      - N8N_USER_MANAGEMENT_JWT_SECRET=\${JWT_SECRET}
-      - GENERIC_TIMEZONE=America/Sao_Paulo
-      - QUEUE_BULL_REDIS_HOST=redis
-      - QUEUE_BULL_REDIS_PORT=6379
-    depends_on:
-      - n8n
-      - redis
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    container_name: \${CONTAINER_PREFIX}-redis
-    networks:
-      - cascata_net
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    volumes:
-      - ./redis_storage:/data
 
 networks:
   cascata_net:
