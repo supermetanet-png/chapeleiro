@@ -24,7 +24,8 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
   
   // INSTALLATION STATE
   const [installModal, setInstallModal] = useState<any>(null);
-  const [installStep, setInstallStep] = useState<'config' | 'deploying' | 'success'>('config');
+  // Novos passos: 'ssl' (gerando cert) -> 'deploying' (subindo docker) -> 'success'
+  const [installStep, setInstallStep] = useState<'config' | 'ssl' | 'deploying' | 'success'>('config');
   const [installing, setInstalling] = useState(false);
   const [availableCerts, setAvailableCerts] = useState<string[]>([]);
 
@@ -80,6 +81,21 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
     finally { setLoadingStore(false); }
   };
 
+  const fetchLogs = async (id: string) => {
+    setLoadingLogs(true);
+    try {
+        const res = await fetch(`/api/control/projects/${projectId}/apps/${id}/logs`, {
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
+        });
+        const data = await res.json();
+        setLogs(data.logs || 'No logs available.');
+    } catch (e) {
+        setLogs('Error fetching logs.');
+    } finally {
+        setLoadingLogs(false);
+    }
+  };
+
   useEffect(() => { 
       fetchSystemConfig();
       if (activeTab === 'installed') fetchInstalledApps();
@@ -101,10 +117,37 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
     if (!finalDomain) return;
 
     setInstalling(true);
-    setInstallStep('deploying');
-
+    
     try {
-      // 2. Install App Logic
+      // 2. SSL Handling FIRST (Before Deploy)
+      // Garantir que os arquivos de certificado existam ANTES do backend gerar o nginx.conf
+      if (sslMode === 'letsencrypt') {
+          if (!adminEmail) throw new Error("Email obrigatório para Let's Encrypt");
+          setInstallStep('ssl');
+          
+          const certRes = await fetch('/api/control/system/certificates', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${localStorage.getItem('cascata_token')}`
+            },
+            body: JSON.stringify({ 
+              domain: finalDomain, 
+              provider: 'letsencrypt',
+              email: adminEmail,
+              isSystem: false
+            })
+          });
+          
+          if (!certRes.ok) {
+              const err = await certRes.json();
+              throw new Error(`Falha no SSL: ${err.error || certRes.statusText}`);
+          }
+      }
+
+      // 3. Install App Logic (Docker Deploy)
+      setInstallStep('deploying');
+      
       const installRes = await fetch(`/api/control/projects/${projectId}/apps/install`, {
         method: 'POST',
         headers: { 
@@ -127,33 +170,19 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
               const textErr = await installRes.text();
               console.error("Install Error (Non-JSON):", textErr);
               if (textErr.includes("504 Gateway Time-out")) {
-                  errorMsg = "O servidor demorou muito para responder (Timeout). O app pode estar instalando em segundo plano. Verifique a aba 'Installed' em alguns minutos.";
+                  // TIMEOUT É TRATADO COMO SUCESSO PARCIAL
+                  // O backend continua rodando o docker-compose mesmo se o nginx cortar
+                  setInstallStep('success');
+                  alert("O servidor demorou para responder (Timeout), mas o processo continua em segundo plano. Verifique o status em alguns minutos.");
+                  fetchInstalledApps();
+                  setInstalling(false);
+                  return;
               } else {
                   errorMsg = `Erro no servidor: ${installRes.status} ${installRes.statusText}`;
               }
           }
           throw new Error(errorMsg);
       }
-
-      // 3. SSL Handling (Se selecionado)
-      if (sslMode === 'letsencrypt') {
-          if (!adminEmail) throw new Error("Email obrigatório para Let's Encrypt");
-          
-          await fetch('/api/control/system/certificates', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${localStorage.getItem('cascata_token')}`
-            },
-            body: JSON.stringify({ 
-              domain: finalDomain, 
-              provider: 'letsencrypt',
-              email: adminEmail,
-              isSystem: false
-            })
-          });
-      } 
-      // Se "existing", o backend já usa o certificado se o arquivo existir no volume
 
       setInstallStep('success');
       fetchInstalledApps();
@@ -186,18 +215,6 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
     } catch(e) {
         alert("Erro ao excluir aplicação. Verifique os logs.");
     }
-  };
-
-  const fetchLogs = async (appId: string) => {
-    setLoadingLogs(true);
-    try {
-        const res = await fetch(`/api/control/projects/${projectId}/apps/${appId}/logs`, {
-            headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
-        });
-        const data = await res.json();
-        setLogs(data.logs);
-    } catch(e) {}
-    finally { setLoadingLogs(false); }
   };
 
   const resetInstallModal = () => {
@@ -400,11 +417,20 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
                   </>
               )}
 
+              {/* NEW STEP: SSL GENERATION */}
+              {installStep === 'ssl' && (
+                  <div className="flex flex-col items-center justify-center py-20">
+                      <Loader2 size={60} className="animate-spin text-emerald-500 mb-6" />
+                      <h3 className="text-xl font-black text-slate-900">Gerando Certificado SSL...</h3>
+                      <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-2">Comunicando com Let's Encrypt (Isso pode levar até 2 min)</p>
+                  </div>
+              )}
+
               {installStep === 'deploying' && (
                   <div className="flex flex-col items-center justify-center py-20">
                       <Loader2 size={60} className="animate-spin text-indigo-600 mb-6" />
-                      <h3 className="text-xl font-black text-slate-900">Provisionando Infraestrutura...</h3>
-                      <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-2">Docker Compose & Nginx</p>
+                      <h3 className="text-xl font-black text-slate-900">Provisionando Containers...</h3>
+                      <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-2">Docker Compose Up (Isso pode levar alguns minutos)</p>
                   </div>
               )}
 
@@ -415,7 +441,7 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
                       </div>
                       <h3 className="text-2xl font-black text-slate-900 mb-2">Deploy Concluído!</h3>
                       <p className="text-slate-500 text-sm font-medium mb-8 max-w-sm">
-                          Sua aplicação está rodando. O SSL pode levar alguns minutos para propagar se foi gerado agora.
+                          Sua aplicação está rodando. O SSL deve estar ativo. Se der erro de certificado, aguarde alguns minutos para propagação.
                       </p>
                       <button onClick={() => { resetInstallModal(); setActiveTab('installed'); }} className="bg-slate-900 text-white px-10 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl hover:bg-emerald-600 transition-all">
                           Ver Aplicação

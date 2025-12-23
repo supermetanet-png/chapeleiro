@@ -234,7 +234,7 @@ const StorageExplorer: React.FC<{ projectId: string }> = ({ projectId }) => {
     checkAuth(async () => {
       try {
         for (const p of paths) {
-          await fetchWithAuth(`/api/data/${projectId}/storage/${selectedBucket}/object?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
+          await fetchWithAuth(`/api/data/${projectId}/storage/${selectedBucket}/object?path=${encodeURIComponent(String(p))}`, { method: 'DELETE' });
         }
         setSelectedItems(new Set());
         fetchItems();
@@ -670,12 +670,12 @@ const StorageExplorer: React.FC<{ projectId: string }> = ({ projectId }) => {
                           <div onClick={e => e.stopPropagation()} className="flex items-center gap-2 bg-white border border-slate-200 rounded-xl p-1">
                              <input 
                               value={parseSizeValue(governance[sector.id]?.max_size || '10MB')}
-                              onChange={(e) => updateSectorSize(sector.id, e.target.value, parseSizeUnit(governance[sector.id]?.max_size || 'MB'))}
+                              onChange={(e) => updateSectorSize(sector.id, e.target.value, parseSizeUnit(String(governance[sector.id]?.max_size || 'MB')))}
                               className="w-16 text-center text-xs font-black text-indigo-600 outline-none"
                              />
                              <select 
-                              value={parseSizeUnit(governance[sector.id]?.max_size || 'MB')}
-                              onChange={(e) => updateSectorSize(sector.id, parseSizeValue(governance[sector.id]?.max_size || '10MB'), e.target.value)}
+                              value={parseSizeUnit(String(governance[sector.id]?.max_size || 'MB'))}
+                              onChange={(e) => updateSectorSize(sector.id, parseSizeValue(String(governance[sector.id]?.max_size || '10MB')), e.target.value)}
                               className="bg-slate-100 rounded-lg text-[9px] font-bold text-slate-500 outline-none px-2 py-1"
                              >
                                <option value="B">Bytes</option><option value="KB">Kilobytes</option><option value="MB">Megabytes</option><option value="GB">Gigabytes</option><option value="TB">Terabytes</option>
