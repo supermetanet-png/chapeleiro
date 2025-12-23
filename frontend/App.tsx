@@ -3,7 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { 
   Database, Settings, Shield, Activity, Code2, Users, Layers,
   ChevronRight, Plus, Search, Terminal, Server, Key, Bell,
-  Command, LogOut, Clock, Settings2, HardDrive, Zap
+  Command, LogOut, Clock, Settings2, HardDrive, Zap, ShoppingBag
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import ProjectDetail from './pages/ProjectDetail';
@@ -17,6 +17,7 @@ import StorageExplorer from './pages/StorageExplorer';
 import EventManager from './pages/EventManager';
 import ProjectLogs from './pages/ProjectLogs';
 import RLSDesigner from './pages/RLSDesigner';
+import AppsManager from './pages/AppsManager';
 
 const App: React.FC = () => {
   const [currentHash, setCurrentHash] = useState(window.location.hash || '#/projects');
@@ -50,8 +51,7 @@ const App: React.FC = () => {
       const projectId = parts[2];
       const section = parts[3] || 'overview';
 
-      // Rota Especial: RLS Designer (Não aparece no menu, acessada via contexto)
-      // Formato: #/project/:id/rls-editor/:entityType/:entityName
+      // Rota Especial: RLS Designer
       if (section === 'rls-editor') {
         const entityType = parts[4] as 'table' | 'bucket';
         const entityName = parts[5];
@@ -67,6 +67,7 @@ const App: React.FC = () => {
         case 'storage': return <StorageExplorer projectId={projectId} />;
         case 'events': return <EventManager projectId={projectId} />;
         case 'logs': return <ProjectLogs projectId={projectId} />;
+        case 'apps': return <AppsManager projectId={projectId} />;
         default: return <ProjectDetail projectId={projectId} />;
       }
     }
@@ -77,7 +78,6 @@ const App: React.FC = () => {
 
   return (
     <div className="flex h-screen bg-[#F8FAFC]">
-      {/* Oculta Sidebar se estiver no modo imersivo do RLS Designer */}
       {!currentHash.includes('/rls-editor') && (
         <aside className="w-[260px] border-r border-slate-200 flex flex-col bg-white shadow-sm z-20">
           <div className="p-5 flex items-center gap-3 border-b border-slate-100">
@@ -95,6 +95,7 @@ const App: React.FC = () => {
               <>
                 <div className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] mb-3 px-3">Instance</div>
                 <SidebarItem icon={<Activity size={18} />} label="Overview" active={currentHash.includes('/overview')} onClick={() => navigate(`#/project/${selectedProjectId}/overview`)} />
+                <SidebarItem icon={<ShoppingBag size={18} />} label="App Store" active={currentHash.includes('/apps')} onClick={() => navigate(`#/project/${selectedProjectId}/apps`)} />
                 <SidebarItem icon={<Database size={18} />} label="Data Browser" active={currentHash.includes('/database')} onClick={() => navigate(`#/project/${selectedProjectId}/database`)} />
                 <SidebarItem icon={<HardDrive size={18} />} label="Native Storage" active={currentHash.includes('/storage')} onClick={() => navigate(`#/project/${selectedProjectId}/storage`)} />
                 <SidebarItem icon={<Zap size={18} />} label="Event Hooks" active={currentHash.includes('/events')} onClick={() => navigate(`#/project/${selectedProjectId}/events`)} />

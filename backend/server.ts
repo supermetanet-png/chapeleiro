@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import os from 'os'; // Adicionado para System Stats
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
 import { AppStore } from './managers/AppStore.js'; 
@@ -284,6 +285,7 @@ class MigrationRunner {
       await client.query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
 
       // 2. CRITICAL TABLES (INLINE SQL - SAFETY NET)
+      
       // Projects Table
       await client.query(`
         CREATE TABLE IF NOT EXISTS system.projects (
@@ -345,6 +347,48 @@ class MigrationRunner {
             container_name_main TEXT,
             env_vars JSONB DEFAULT '{}',
             status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // Logs Table (Critical for Observability)
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS system.api_logs (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            project_slug TEXT NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            status_code INTEGER,
+            client_ip TEXT,
+            duration_ms INTEGER,
+            user_role TEXT,
+            payload JSONB,
+            headers JSONB,
+            user_agent TEXT,
+            geo_info JSONB DEFAULT '{}',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // Assets and Webhooks
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS system.assets (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            project_slug TEXT NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            parent_id UUID,
+            metadata JSONB DEFAULT '{}',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS system.webhooks (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            project_slug TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            is_active BOOLEAN DEFAULT true,
+            secret_header TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
       `);
@@ -751,8 +795,36 @@ app.use(cascataAuth as any);
 
 // --- ROUTES ---
 
+// Health Check
 app.get('/', (req, res) => { res.send('Cascata Engine OK'); });
 app.get('/health', (req, res) => { res.json({ status: 'ok', time: new Date() }); });
+
+// --- SYSTEM STATS (NEW) ---
+app.get('/api/control/system/usage', (req, res) => {
+    try {
+        const cpus = os.cpus();
+        const freeMem = os.freemem();
+        const totalMem = os.totalmem();
+        const loadAvg = os.loadavg();
+        
+        res.json({
+            cpu: {
+                model: cpus[0].model,
+                cores: cpus.length,
+                usage_percent: loadAvg[0] / cpus.length * 100 // Crude approximation
+            },
+            memory: {
+                free: freeMem,
+                total: totalMem,
+                used: totalMem - freeMem,
+                percent: ((totalMem - freeMem) / totalMem) * 100
+            },
+            uptime: os.uptime()
+        });
+    } catch(e) {
+        res.status(500).json({ error: "Failed to get system stats" });
+    }
+});
 
 // --- CONTROL PLANE: STORE & APPS (NEW) ---
 
@@ -782,7 +854,7 @@ app.get('/api/control/projects/:slug/apps', async (req: any, res: any) => {
     } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-// 4. App Actions
+// 4. App Actions (Delete, Stop, Start, Logs)
 app.delete('/api/control/projects/:slug/apps/:id', async (req: any, res: any) => {
     try {
         await appStore.deleteApp(req.params.id);
@@ -874,10 +946,16 @@ app.post('/api/control/system/settings', async (req: any, res: any) => {
 app.post('/api/control/system/ssl-check', async (req: any, res: any) => {
   const { domain } = req.body;
   if (!domain) { res.status(400).json({ error: 'Domain required' }); return; }
+  
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
-    await fetch(`https://${domain}`, { method: 'HEAD', signal: controller.signal });
+    
+    await fetch(`https://${domain}`, { 
+        method: 'HEAD', 
+        signal: controller.signal,
+    });
+    
     clearTimeout(timeoutId);
     res.json({ status: 'active' });
   } catch (e: any) {
@@ -917,6 +995,7 @@ app.post('/api/control/projects', async (req: any, res: any) => {
       CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
       CREATE EXTENSION IF NOT EXISTS "pgcrypto";
       CREATE SCHEMA IF NOT EXISTS auth;
+      
       CREATE TABLE IF NOT EXISTS auth.users (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         created_at TIMESTAMPTZ DEFAULT now(),
@@ -924,6 +1003,7 @@ app.post('/api/control/projects', async (req: any, res: any) => {
         banned BOOLEAN DEFAULT false,
         raw_user_meta_data JSONB DEFAULT '{}'
       );
+
       CREATE TABLE IF NOT EXISTS auth.identities (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
@@ -935,6 +1015,7 @@ app.post('/api/control/projects', async (req: any, res: any) => {
         last_sign_in_at TIMESTAMPTZ,
         UNIQUE(provider, identifier)
       );
+
       CREATE TABLE IF NOT EXISTS auth.otp_codes (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         identifier TEXT NOT NULL,
@@ -943,6 +1024,7 @@ app.post('/api/control/projects', async (req: any, res: any) => {
         expires_at TIMESTAMPTZ NOT NULL,
         created_at TIMESTAMPTZ DEFAULT now()
       );
+
       GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
       GRANT USAGE ON SCHEMA auth TO service_role;
       GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
@@ -966,23 +1048,36 @@ app.delete('/api/control/projects/:slug', async (req: any, res: any) => {
   try {
     const result = await systemPool.query('SELECT * FROM system.projects WHERE slug = $1', [slug]);
     if ((result.rowCount ?? 0) === 0) { res.status(404).json({ error: 'Project not found' }); return; }
+    
     const project = result.rows[0];
+    
     await PoolManager.close(project.db_name);
+
     try {
         await systemPool.query(`DROP DATABASE IF EXISTS ${quoteId(project.db_name)}`);
     } catch (dbErr: any) {
-        await systemPool.query(`SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = $1 AND pid <> pg_backend_pid()`, [project.db_name]);
+        await systemPool.query(`
+            SELECT pg_terminate_backend(pg_stat_activity.pid)
+            FROM pg_stat_activity
+            WHERE pg_stat_activity.datname = $1
+            AND pid <> pg_backend_pid()`, [project.db_name]);
         await systemPool.query(`DROP DATABASE IF EXISTS ${quoteId(project.db_name)}`);
     }
+
     await systemPool.query('DELETE FROM system.projects WHERE slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.assets WHERE project_slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.webhooks WHERE project_slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.api_logs WHERE project_slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.ui_settings WHERE project_slug = $1', [slug]);
-    await systemPool.query('DELETE FROM system.apps WHERE project_slug = $1', [slug]);
+    await systemPool.query('DELETE FROM system.apps WHERE project_slug = $1', [slug]); // DELETE APPS
+
     const storagePath = path.join(STORAGE_ROOT, slug);
-    if (fs.existsSync(storagePath)) fs.rmSync(storagePath, { recursive: true, force: true });
+    if (fs.existsSync(storagePath)) {
+        fs.rmSync(storagePath, { recursive: true, force: true });
+    }
+    
     await CertificateManager.rebuildNginxConfigs();
+
     res.json({ success: true });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -993,15 +1088,25 @@ app.patch('/api/control/projects/:slug', async (req: any, res: any) => {
     let metadataQueryPart = 'metadata'; 
     const params = [custom_domain, log_retention_days, req.params.slug, ssl_certificate_source];
     let paramIdx = 5;
+
     if (metadata) {
         metadataQueryPart = `COALESCE(metadata, '{}'::jsonb) || $${paramIdx}::jsonb`;
         params.push(JSON.stringify(metadata));
     }
+
     const result = await systemPool.query(
-      `UPDATE system.projects SET custom_domain = COALESCE($1, custom_domain), log_retention_days = COALESCE($2, log_retention_days), ssl_certificate_source = COALESCE($4, ssl_certificate_source), metadata = ${metadataQueryPart}, updated_at = now() WHERE slug = $3 RETURNING *`,
+      `UPDATE system.projects 
+       SET custom_domain = COALESCE($1, custom_domain), 
+           log_retention_days = COALESCE($2, log_retention_days),
+           ssl_certificate_source = COALESCE($4, ssl_certificate_source),
+           metadata = ${metadataQueryPart},
+           updated_at = now() 
+       WHERE slug = $3 RETURNING *`,
       params
     );
+    
     await CertificateManager.rebuildNginxConfigs();
+    
     res.json(result.rows[0]);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -1014,20 +1119,36 @@ app.post('/api/control/projects/:slug/rotate-keys', async (req: any, res: any) =
   else if (type === 'service') column = 'service_key';
   else if (type === 'jwt') column = 'jwt_secret';
   else { res.status(400).json({ error: 'Invalid key type' }); return; }
+
   try {
-    await systemPool.query(`UPDATE system.projects SET ${column} = $1 WHERE slug = $2`, [newKey, req.params.slug]);
+    await systemPool.query(
+      `UPDATE system.projects SET ${column} = $1 WHERE slug = $2`,
+      [newKey, req.params.slug]
+    );
     res.json({ success: true, type, newKey: 'HIDDEN_IN_RESPONSE' });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/control/projects/:slug/block-ip', async (req: any, res: any) => {
   const { ip } = req.body;
-  try { await systemPool.query('UPDATE system.projects SET blocklist = array_append(blocklist, $1) WHERE slug = $2', [ip, req.params.slug]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    await systemPool.query(
+      'UPDATE system.projects SET blocklist = array_append(blocklist, $1) WHERE slug = $2', 
+      [ip, req.params.slug]
+    );
+    res.json({ success: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/control/projects/:slug/blocklist/:ip', async (req: any, res: any) => {
   const { ip } = req.params;
-  try { await systemPool.query('UPDATE system.projects SET blocklist = array_remove(blocklist, $1) WHERE slug = $2', [ip, req.params.slug]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    await systemPool.query(
+      'UPDATE system.projects SET blocklist = array_remove(blocklist, $1) WHERE slug = $2', 
+      [ip, req.params.slug]
+    );
+    res.json({ success: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/control/me/ip', (req: any, res: any) => {
@@ -1039,30 +1160,60 @@ app.get('/api/control/me/ip', (req: any, res: any) => {
 });
 
 app.get('/api/control/projects/:slug/webhooks', async (req: any, res: any) => {
-  try { const result = await systemPool.query('SELECT * FROM system.webhooks WHERE project_slug = $1', [req.params.slug]); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    const result = await systemPool.query('SELECT * FROM system.webhooks WHERE project_slug = $1', [req.params.slug]);
+    res.json(result.rows);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/control/projects/:slug/webhooks', async (req: any, res: any) => {
   const { target_url, event_type, table_name } = req.body;
-  try { await systemPool.query('INSERT INTO system.webhooks (project_slug, target_url, event_type, table_name) VALUES ($1, $2, $3, $4)', [req.params.slug, target_url, event_type, table_name]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    await systemPool.query(
+      'INSERT INTO system.webhooks (project_slug, target_url, event_type, table_name) VALUES ($1, $2, $3, $4)',
+      [req.params.slug, target_url, event_type, table_name]
+    );
+    res.json({ success: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/control/projects/:slug/logs', async (req: any, res: any) => {
   const { days } = req.query;
-  try { await systemPool.query(`DELETE FROM system.api_logs WHERE project_slug = $1 AND created_at < now() - interval '${Number(days)} days'`, [req.params.slug]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    await systemPool.query(
+      `DELETE FROM system.api_logs WHERE project_slug = $1 AND created_at < now() - interval '${Number(days)} days'`,
+      [req.params.slug]
+    );
+    res.json({ success: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/control/system/certificates/status', async (req: any, res: any) => {
-  try { const status = await CertificateManager.detectEnvironment(); res.json(status); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    const status = await CertificateManager.detectEnvironment();
+    res.json(status);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/control/system/certificates', async (req: any, res: any) => {
   const { domain, email, cert, key, provider, isSystem } = req.body;
-  try { const result = await CertificateManager.requestCertificate(domain, email, provider, { cert, key }, isSystem); res.json(result); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    const result = await CertificateManager.requestCertificate(
+        domain, 
+        email, 
+        provider, 
+        { cert, key },
+        isSystem
+    );
+    res.json(result);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/control/system/certificates/:domain', async (req: any, res: any) => {
-    try { await CertificateManager.deleteCertificate(req.params.domain); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
+    try {
+        await CertificateManager.deleteCertificate(req.params.domain);
+        res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 // --- DATA PLANE ROUTES ---
@@ -1075,40 +1226,75 @@ app.get('/api/data/:slug/stats', async (req: any, res: any) => {
       r.projectPool!.query("SELECT count(*) FROM auth.users"),
       r.projectPool!.query("SELECT pg_size_pretty(pg_database_size(current_database()))")
     ]);
-    res.json({ tables: parseInt(tables.rows[0].count), users: parseInt(users.rows[0].count), size: size.rows[0].pg_size_pretty });
+    res.json({
+      tables: parseInt(tables.rows[0].count),
+      users: parseInt(users.rows[0].count),
+      size: size.rows[0].pg_size_pretty
+    });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/tables', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try { const result = await r.projectPool!.query("SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name NOT LIKE '_deleted_%'"); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    const result = await r.projectPool!.query(
+      "SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name NOT LIKE '_deleted_%'"
+    );
+    res.json(result.rows);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/recycle-bin', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try { const result = await r.projectPool!.query("SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '_deleted_%'"); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    const result = await r.projectPool!.query(
+      "SELECT table_name as name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '_deleted_%'"
+    );
+    res.json(result.rows);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/recycle-bin/:table/restore', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const tableName = req.params.table;
-  try { const originalName = tableName.replace(/^_deleted_\d+_/, ''); await r.projectPool!.query(`ALTER TABLE public.${quoteId(tableName)} RENAME TO ${quoteId(originalName)}`); res.json({ success: true, restoredName: originalName }); } catch (e: any) { res.status(400).json({ error: e.message }); }
+  try {
+    const originalName = tableName.replace(/^_deleted_\d+_/, '');
+    await r.projectPool!.query(`ALTER TABLE public.${quoteId(tableName)} RENAME TO ${quoteId(originalName)}`);
+    res.json({ success: true, restoredName: originalName });
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.delete('/api/data/:slug/recycle-bin/:table', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try { await r.projectPool!.query(`DROP TABLE public.${quoteId(req.params.table)} CASCADE`); res.json({ success: true }); } catch (e: any) { res.status(400).json({ error: e.message }); }
+  try {
+    await r.projectPool!.query(`DROP TABLE public.${quoteId(req.params.table)} CASCADE`);
+    res.json({ success: true });
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/tables/:table/sql', async (req: any, res: any) => {
     const r = req as CascataRequest;
     const { table } = req.params;
     try {
-        const columnsRes = await r.projectPool!.query(`SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = $1`, [table]);
-        if (columnsRes.rowCount === 0) { res.json({ sql: `-- Table ${table} not found` }); return; }
+        const columnsRes = await r.projectPool!.query(
+            `SELECT column_name, data_type, is_nullable, column_default 
+             FROM information_schema.columns 
+             WHERE table_name = $1`, 
+            [table]
+        );
+        if (columnsRes.rowCount === 0) {
+            res.json({ sql: `-- Table ${table} not found or empty` });
+            return;
+        }
         let sql = `CREATE TABLE public."${table}" (\n`;
-        const cols = columnsRes.rows.map(c => `  "${c.column_name}" ${c.data_type.toUpperCase()}${c.is_nullable === 'NO' ? ' NOT NULL' : ''}${c.column_default ? ` DEFAULT ${c.column_default}` : ''}`);
-        sql += cols.join(',\n') + '\n);';
+        const cols = columnsRes.rows.map(c => {
+            let line = `  "${c.column_name}" ${c.data_type.toUpperCase()}`;
+            if (c.is_nullable === 'NO') line += ' NOT NULL';
+            if (c.column_default) line += ` DEFAULT ${c.column_default}`;
+            return line;
+        });
+        sql += cols.join(',\n');
+        sql += '\n);';
         res.json({ sql });
     } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -1122,11 +1308,15 @@ app.post('/api/data/:slug/tables', async (req: any, res: any) => {
     if (c.nullable === false) def += ' NOT NULL';
     if (c.isUnique) def += ' UNIQUE'; 
     if (c.default) def += ` DEFAULT ${c.default}`;
-    if (c.foreignKey) def += ` REFERENCES public.${quoteId(c.foreignKey.table)}(${quoteId(c.foreignKey.column)})`;
+    if (c.foreignKey) {
+       def += ` REFERENCES public.${quoteId(c.foreignKey.table)}(${quoteId(c.foreignKey.column)})`;
+    }
     return def;
   }).join(', ');
+
+  const sql = `CREATE TABLE public.${quoteId(name)} (${colsSql})`;
   try {
-    await r.projectPool!.query(`CREATE TABLE public.${quoteId(name)} (${colsSql})`);
+    await r.projectPool!.query(sql);
     await r.projectPool!.query(`ALTER TABLE public.${quoteId(name)} ENABLE ROW LEVEL SECURITY`);
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
@@ -1135,23 +1325,34 @@ app.post('/api/data/:slug/tables', async (req: any, res: any) => {
 app.post('/api/data/:slug/tables/:table/columns', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { name, type, isNullable, defaultValue, isUnique } = req.body;
+  if (!name || !type) { res.status(400).json({ error: 'Name and Type required' }); return; }
   let sql = `ALTER TABLE public.${quoteId(req.params.table)} ADD COLUMN ${quoteId(name)} ${type}`;
   if (!isNullable) sql += ' NOT NULL';
   if (defaultValue) sql += ` DEFAULT ${defaultValue}`;
   if (isUnique) sql += ' UNIQUE';
-  try { await r.projectPool!.query(sql); res.json({ success: true }); } catch (e: any) { res.status(400).json({ error: e.message }); }
+  try {
+    await r.projectPool!.query(sql);
+    res.json({ success: true });
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.patch('/api/data/:slug/tables/:table/rename', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try { await r.projectPool!.query(`ALTER TABLE public.${quoteId(req.params.table)} RENAME TO ${quoteId(req.body.newName)}`); res.json({ success: true }); } catch (e: any) { res.status(400).json({ error: e.message }); }
+  const { newName } = req.body;
+  if (!newName) { res.status(400).json({ error: 'New name required' }); return; }
+  try {
+    await r.projectPool!.query(`ALTER TABLE public.${quoteId(req.params.table)} RENAME TO ${quoteId(newName)}`);
+    res.json({ success: true });
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/tables/:table/duplicate', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { newName, withData } = req.body;
+  if (!newName) { res.status(400).json({ error: 'New name required' }); return; }
   try {
-    await r.projectPool!.query(`CREATE TABLE public.${quoteId(newName)} AS TABLE public.${quoteId(req.params.table)} ${withData ? '' : 'WITH NO DATA'}`);
+    const option = withData ? '' : 'WITH NO DATA';
+    await r.projectPool!.query(`CREATE TABLE public.${quoteId(newName)} AS TABLE public.${quoteId(req.params.table)} ${option}`);
     await r.projectPool!.query(`ALTER TABLE public.${quoteId(newName)} ENABLE ROW LEVEL SECURITY`);
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
@@ -1161,8 +1362,13 @@ app.delete('/api/data/:slug/tables/:table', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { mode } = req.body;
   try {
-    if (mode === 'CASCADE' || mode === 'RESTRICT') await r.projectPool!.query(`DROP TABLE public.${quoteId(req.params.table)} ${mode === 'CASCADE' ? 'CASCADE' : ''}`);
-    else await r.projectPool!.query(`ALTER TABLE public.${quoteId(req.params.table)} RENAME TO ${quoteId(`_deleted_${Date.now()}_${req.params.table}`)}`);
+    if (mode === 'CASCADE' || mode === 'RESTRICT') {
+        const cascadeSql = mode === 'CASCADE' ? 'CASCADE' : '';
+        await r.projectPool!.query(`DROP TABLE public.${quoteId(req.params.table)} ${cascadeSql}`);
+    } else {
+        const deletedName = `_deleted_${Date.now()}_${req.params.table}`;
+        await r.projectPool!.query(`ALTER TABLE public.${quoteId(req.params.table)} RENAME TO ${quoteId(deletedName)}`);
+    }
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
@@ -1170,7 +1376,15 @@ app.delete('/api/data/:slug/tables/:table', async (req: any, res: any) => {
 app.get('/api/data/:slug/tables/:table/columns', async (req: any, res: any) => {
   const r = req as CascataRequest;
   try {
-    const result = await r.projectPool!.query(`SELECT column_name as name, data_type as type, is_nullable = 'YES' as "isNullable", EXISTS (SELECT 1 FROM information_schema.key_column_usage kcu WHERE kcu.table_name = $1 AND kcu.column_name = c.column_name) as "isPrimaryKey" FROM information_schema.columns c WHERE table_name = $1`, [req.params.table]);
+    const result = await r.projectPool!.query(
+      `SELECT column_name as name, data_type as type, is_nullable = 'YES' as "isNullable", 
+       EXISTS (
+         SELECT 1 FROM information_schema.key_column_usage kcu 
+         WHERE kcu.table_name = $1 AND kcu.column_name = c.column_name
+       ) as "isPrimaryKey" 
+       FROM information_schema.columns c WHERE table_name = $1`,
+      [req.params.table]
+    );
     res.json(result.rows);
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -1178,7 +1392,8 @@ app.get('/api/data/:slug/tables/:table/columns', async (req: any, res: any) => {
 app.post('/api/data/:slug/tables/:table/rows', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { data } = req.body;
-  const rows = Array.isArray(data) ? data : [data];
+  const isBatch = Array.isArray(data);
+  const rows = isBatch ? data : [data];
   if (rows.length === 0) { res.json([]); return; }
   try {
     const resultRows = await queryWithRLS(r, async (client) => {
@@ -1190,23 +1405,32 @@ app.post('/api/data/:slug/tables/:table/rows', async (req: any, res: any) => {
             const cols = keys.map(k => quoteId(k)).join(',');
             const values = keys.map(k => row[k]);
             const placeholders = keys.map((_, i) => `$${i + 1}`).join(',');
-            const res = await client.query(`INSERT INTO public.${quoteId(req.params.table)} (${cols}) VALUES (${placeholders}) RETURNING *`, values);
+            const res = await client.query(
+                `INSERT INTO public.${quoteId(req.params.table)} (${cols}) VALUES (${placeholders}) RETURNING *`,
+                values
+            );
             allResults.push(res.rows[0]);
         }
         await client.query('COMMIT');
         return allResults;
     });
-    res.json(Array.isArray(data) ? resultRows : resultRows[0]);
+    res.json(isBatch ? resultRows : resultRows[0]);
   } catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/tables/:table/data', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { select, limit = 100 } = req.query;
-  const cols = (typeof select === 'string' && select !== '*') ? select.split(',').map(c => quoteId(c.trim())).join(',') : '*';
+  let cols = '*';
+  if (typeof select === 'string' && select !== '*') {
+    cols = select.split(',').map(c => quoteId(c.trim())).join(',');
+  }
   try {
     const rows = await queryWithRLS(r, async (client) => {
-        const result = await client.query(`SELECT ${cols} FROM public.${quoteId(req.params.table)} LIMIT $1`, [limit]);
+        const result = await client.query(
+            `SELECT ${cols} FROM public.${quoteId(req.params.table)} LIMIT $1`, 
+            [limit]
+        );
         return result.rows;
     });
     res.json(rows);
@@ -1221,7 +1445,10 @@ app.put('/api/data/:slug/tables/:table/rows', async (req: any, res: any) => {
   const values = [...keys.map(k => data[k]), pkValue];
   try {
     await queryWithRLS(r, async (client) => {
-        await client.query(`UPDATE public.${quoteId(req.params.table)} SET ${setClause} WHERE ${quoteId(pkColumn)} = $${values.length}`, values);
+        await client.query(
+            `UPDATE public.${quoteId(req.params.table)} SET ${setClause} WHERE ${quoteId(pkColumn)} = $${values.length}`,
+            values
+        );
     });
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
@@ -1232,7 +1459,10 @@ app.post('/api/data/:slug/tables/:table/delete-rows', async (req: any, res: any)
   const { ids, pkColumn } = req.body;
   try {
     await queryWithRLS(r, async (client) => {
-        await client.query(`DELETE FROM public.${quoteId(req.params.table)} WHERE ${quoteId(pkColumn)} = ANY($1)`, [ids]);
+        await client.query(
+            `DELETE FROM public.${quoteId(req.params.table)} WHERE ${quoteId(pkColumn)} = ANY($1)`,
+            [ids]
+        );
     });
     res.json({ success: true });
   } catch (e: any) { res.status(400).json({ error: e.message }); }
@@ -1256,7 +1486,10 @@ app.post('/api/data/:slug/rpc/:name', async (req: any, res: any) => {
   const values = Object.values(params);
   try {
     const rows = await queryWithRLS(r, async (client) => {
-        const result = await client.query(`SELECT * FROM public.${quoteId(req.params.name)}(${placeholders})`, values);
+        const result = await client.query(
+            `SELECT * FROM public.${quoteId(req.params.name)}(${placeholders})`, 
+            values
+        );
         return result.rows;
     });
     res.json(rows);
@@ -1265,7 +1498,10 @@ app.post('/api/data/:slug/rpc/:name', async (req: any, res: any) => {
 
 app.get('/api/data/:slug/auth/users', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try { const result = await r.projectPool!.query(`SELECT u.id, u.created_at, u.banned, u.last_sign_in_at, jsonb_agg(jsonb_build_object('id', i.id, 'provider', i.provider, 'identifier', i.identifier)) as identities FROM auth.users u LEFT JOIN auth.identities i ON u.id = i.user_id GROUP BY u.id ORDER BY u.created_at DESC`); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    const result = await r.projectPool!.query(`SELECT u.id, u.created_at, u.banned, u.last_sign_in_at, jsonb_agg(jsonb_build_object('id', i.id, 'provider', i.provider, 'identifier', i.identifier)) as identities FROM auth.users u LEFT JOIN auth.identities i ON u.id = i.user_id GROUP BY u.id ORDER BY u.created_at DESC`);
+    res.json(result.rows);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/auth/users', async (req: any, res: any) => {
@@ -1276,10 +1512,15 @@ app.post('/api/data/:slug/auth/users', async (req: any, res: any) => {
     await client.query('BEGIN');
     const userRes = await client.query('INSERT INTO auth.users (raw_user_meta_data) VALUES ($1) RETURNING id', [profileData || {}]);
     const userId = userRes.rows[0].id;
-    if (strategies) { for (const s of strategies) await client.query('INSERT INTO auth.identities (user_id, provider, identifier, password_hash) VALUES ($1, $2, $3, $4)', [userId, s.provider, s.identifier, s.password]); }
+    if (strategies) {
+        for (const s of strategies) await client.query('INSERT INTO auth.identities (user_id, provider, identifier, password_hash) VALUES ($1, $2, $3, $4)', [userId, s.provider, s.identifier, s.password]);
+    }
     await client.query('COMMIT');
     res.json({ success: true, id: userId });
-  } catch (e: any) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); } finally { client.release(); }
+  } catch (e: any) { 
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: e.message }); 
+  } finally { client.release(); }
 });
 
 app.patch('/api/data/:slug/auth/users/:id/status', async (req: any, res: any) => {
@@ -1314,11 +1555,21 @@ app.post('/api/data/:slug/auth/link', async (req: any, res: any) => {
         try {
             await client.query('BEGIN');
             for (const table of linked_tables) {
-                await client.query(`ALTER TABLE public.${quoteId(table)} ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL`);
-                await client.query(`CREATE INDEX IF NOT EXISTS ${quoteId('idx_' + table + '_user_id')} ON public.${quoteId(table)} (user_id)`);
+                await client.query(
+                    `ALTER TABLE public.${quoteId(table)} 
+                     ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL`
+                );
+                await client.query(
+                    `CREATE INDEX IF NOT EXISTS ${quoteId('idx_' + table + '_user_id')} ON public.${quoteId(table)} (user_id)`
+                );
             }
             await client.query('COMMIT');
-        } catch (dbErr: any) { await client.query('ROLLBACK'); console.error("Link Table Error:", dbErr); } finally { client.release(); }
+        } catch (dbErr: any) {
+            await client.query('ROLLBACK');
+            console.error("Link Table Error:", dbErr);
+        } finally {
+            client.release();
+        }
     }
     res.json({ success: true });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
@@ -1331,10 +1582,19 @@ const walk = (dir: string, rootPath: string, fileList: any[] = []) => {
       const filePath = path.join(dir, file);
       const stat = fs.statSync(filePath);
       const relativePath = path.relative(rootPath, filePath).replace(/\\/g, '/');
-      fileList.push({ name: file, type: stat.isDirectory() ? 'folder' : 'file', size: stat.size, updated_at: stat.mtime.toISOString(), path: relativePath });
-      if (stat.isDirectory()) walk(filePath, rootPath, fileList);
+      fileList.push({
+        name: file,
+        type: stat.isDirectory() ? 'folder' : 'file',
+        size: stat.size,
+        updated_at: stat.mtime.toISOString(),
+        path: relativePath
+      });
+      if (stat.isDirectory()) {
+        walk(filePath, rootPath, fileList);
+      }
     });
-  } catch (e) {}
+  } catch (e) {
+  }
   return fileList;
 };
 
@@ -1348,9 +1608,13 @@ app.get('/api/data/:slug/storage/search', async (req: any, res: any) => {
   if (!searchRoot.startsWith(projectRoot)) { res.status(403).json({ error: 'Access Denied' }); return; }
   try {
     let allFiles = walk(searchRoot, bucket ? searchRoot : projectRoot, []);
-    if (searchTerm) allFiles = allFiles.filter(f => f.name.toLowerCase().includes(searchTerm));
+    if (searchTerm) {
+      allFiles = allFiles.filter(f => f.name.toLowerCase().includes(searchTerm));
+    }
     res.json({ items: allFiles });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/data/:slug/storage/buckets', async (req: any, res: any) => {
@@ -1383,7 +1647,12 @@ app.delete('/api/data/:slug/storage/buckets/:name', async (req: any, res: any) =
   const bucketPath = path.join(STORAGE_ROOT, r.project.slug, req.params.name);
   if (!fs.existsSync(bucketPath)) { res.status(404).json({ error: 'Bucket not found' }); return; }
   if (!bucketPath.startsWith(path.join(STORAGE_ROOT, r.project.slug))) { res.status(403).json({ error: 'Access denied' }); return; }
-  try { fs.rmSync(bucketPath, { recursive: true, force: true }); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+      fs.rmSync(bucketPath, { recursive: true, force: true });
+      res.json({ success: true });
+  } catch (e: any) {
+      res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/data/:slug/storage/:bucket/folder', async (req: any, res: any) => {
@@ -1392,7 +1661,12 @@ app.post('/api/data/:slug/storage/:bucket/folder', async (req: any, res: any) =>
   const bucketPath = path.join(STORAGE_ROOT, r.project.slug, req.params.bucket);
   const folderPath = path.join(bucketPath, relativePath || '', name);
   if (!folderPath.startsWith(bucketPath)) { res.status(403).json({ error: 'Access Denied' }); return; }
-  if (!fs.existsSync(folderPath)) { fs.mkdirSync(folderPath, { recursive: true }); res.json({ success: true }); } else { res.status(400).json({ error: 'Folder exists' }); }
+  if (!fs.existsSync(folderPath)) {
+    fs.mkdirSync(folderPath, { recursive: true });
+    res.json({ success: true });
+  } else {
+    res.status(400).json({ error: 'Folder exists' });
+  }
 });
 
 app.get('/api/data/:slug/storage/:bucket/list', async (req: any, res: any) => {
@@ -1407,7 +1681,13 @@ app.get('/api/data/:slug/storage/:bucket/list', async (req: any, res: any) => {
     const items = files.map(file => {
       const filePath = path.join(targetPath, file);
       const stat = fs.statSync(filePath);
-      return { name: file, type: stat.isDirectory() ? 'folder' : 'file', size: stat.size, updated_at: stat.mtime.toISOString(), path: path.relative(bucketPath, filePath).replace(/\\/g, '/') };
+      return {
+        name: file,
+        type: stat.isDirectory() ? 'folder' : 'file',
+        size: stat.size,
+        updated_at: stat.mtime.toISOString(),
+        path: path.relative(bucketPath, filePath).replace(/\\/g, '/')
+      };
     });
     res.json({ items });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
@@ -1430,9 +1710,19 @@ app.post('/api/data/:slug/storage/:bucket/upload', upload.single('file') as any,
   const ext = path.extname(r.file.originalname).replace('.', '').toLowerCase();
   const sector = getSectorForExt(ext);
   const rule = governance[sector] || governance['global'] || { max_size: '10MB', allowed_exts: [] };
-  if (rule.allowed_exts && !rule.allowed_exts.includes(ext)) { fs.unlinkSync(r.file.path); res.status(403).json({ error: `Policy Violation: Extension .${ext} is not allowed.` }); return; }
+  if (rule.allowed_exts) {
+      if (!rule.allowed_exts.includes(ext)) {
+          fs.unlinkSync(r.file.path);
+          res.status(403).json({ error: `Policy Violation: Extension .${ext} is not allowed. Allowed: [${rule.allowed_exts.join(', ')}]` });
+          return;
+      }
+  }
   const maxBytes = parseBytes(rule.max_size);
-  if (r.file.size > maxBytes) { fs.unlinkSync(r.file.path); res.status(403).json({ error: `Policy Violation: File size exceeds limit.` }); return; }
+  if (r.file.size > maxBytes) {
+      fs.unlinkSync(r.file.path);
+      res.status(403).json({ error: `Policy Violation: File size (${(r.file.size/1024).toFixed(2)}KB) exceeds limit of ${rule.max_size} for ${sector}.` });
+      return;
+  }
   const dest = path.join(STORAGE_ROOT, r.project.slug, req.params.bucket, r.body.path || '', r.file.originalname);
   if (!fs.existsSync(path.dirname(dest))) fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.renameSync(r.file.path, dest);
@@ -1450,7 +1740,10 @@ app.post('/api/data/:slug/storage/move', async (req: any, res: any) => {
       const source = path.join(root, bucket, itemPath);
       const itemName = path.basename(itemPath);
       const target = path.join(destPath, itemName);
-      if (fs.existsSync(source)) { fs.renameSync(source, target); movedCount++; }
+      if (fs.existsSync(source)) {
+          fs.renameSync(source, target);
+          movedCount++;
+      }
   }
   res.json({ success: true, moved: movedCount });
 });
@@ -1459,25 +1752,41 @@ app.delete('/api/data/:slug/storage/:bucket/object', async (req: any, res: any) 
   const r = req as CascataRequest;
   const { path: queryPath } = req.query;
   const filePath = path.join(STORAGE_ROOT, r.project.slug, req.params.bucket, (queryPath as string));
-  if (fs.existsSync(filePath)) { fs.rmSync(filePath, { recursive: true, force: true }); res.json({ success: true }); } else { res.status(404).json({ error: 'Not found' }); }
+  if (fs.existsSync(filePath)) {
+    fs.rmSync(filePath, { recursive: true, force: true });
+    res.json({ success: true });
+  } else {
+    res.status(404).json({ error: 'Not found' });
+  }
 });
 
 app.get('/api/data/:slug/logs', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try { const result = await systemPool.query('SELECT * FROM system.api_logs WHERE project_slug = $1 ORDER BY created_at DESC LIMIT 100', [r.project.slug]); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    const result = await systemPool.query('SELECT * FROM system.api_logs WHERE project_slug = $1 ORDER BY created_at DESC LIMIT 100', [r.project.slug]);
+    res.json(result.rows);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/data/:slug/assets', async (req: any, res: any) => {
   const r = req as CascataRequest;
-  try { const result = await systemPool.query('SELECT * FROM system.assets WHERE project_slug = $1', [r.project.slug]); res.json(result.rows); } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try {
+    const result = await systemPool.query('SELECT * FROM system.assets WHERE project_slug = $1', [r.project.slug]);
+    res.json(result.rows);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/data/:slug/assets', async (req: any, res: any) => {
   const r = req as CascataRequest;
   const { id, name, type, parent_id, metadata } = req.body;
   try {
-    if (id) { const upd = await systemPool.query('UPDATE system.assets SET name=$1, metadata=$2 WHERE id=$3 RETURNING *', [name, metadata, id]); res.json(upd.rows[0]); } 
-    else { const ins = await systemPool.query('INSERT INTO system.assets (project_slug, name, type, parent_id, metadata) VALUES ($1, $2, $3, $4, $5) RETURNING *', [r.project.slug, name, type, parent_id, metadata]); res.json(ins.rows[0]); }
+    if (id) {
+       const upd = await systemPool.query('UPDATE system.assets SET name=$1, metadata=$2 WHERE id=$3 RETURNING *', [name, metadata, id]);
+       res.json(upd.rows[0]);
+    } else {
+       const ins = await systemPool.query('INSERT INTO system.assets (project_slug, name, type, parent_id, metadata) VALUES ($1, $2, $3, $4, $5) RETURNING *', [r.project.slug, name, type, parent_id, metadata]);
+       res.json(ins.rows[0]);
+    }
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1523,13 +1832,29 @@ app.post('/api/data/:slug/ui-settings/:table', async (req: any, res: any) => {
   try { await systemPool.query(`INSERT INTO system.ui_settings (project_slug, table_name, settings) VALUES ($1, $2, $3) ON CONFLICT (project_slug, table_name) DO UPDATE SET settings = $3`, [r.project.slug, req.params.table, req.body.settings]); res.json({ success: true }); } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-// STARTUP
+// SAFE STARTUP WRAPPER
 (async () => {
   try {
     console.log('[System] Initializing Cascata Backend...');
+    
+    // 1. Ensure a fallback certificate exists so Nginx doesn't crash on boot
     await CertificateManager.ensureSystemCert();
-    app.listen(PORT, () => console.log(`[CASCATA SECURE ENGINE] v5.5 Listening on port ${PORT}`));
+
+    // 2. START SERVER IMMEDIATELY (Prevents 502 loop)
+    app.listen(PORT, () => {
+      console.log(`[CASCATA SECURE ENGINE] v5.5 Listening on port ${PORT} (Optimistic Start)`);
+    });
+
+    // 3. Run checks in background
     const dbReady = await waitForDatabase(15, 3000); 
-    if (dbReady) await MigrationRunner.run();
-  } catch (e) { console.error('[System] FATAL ERROR during startup:', e); }
+    if (dbReady) {
+      await MigrationRunner.run();
+    } else {
+      console.warn('[System] Warning: Database connection flaky. Running in Maintenance Mode.');
+    }
+
+  } catch (e) {
+    console.error('[System] FATAL ERROR during startup:', e);
+    // DO NOT EXIT - Let Docker restart if it must, but try to stay up to log errors
+  }
 })();

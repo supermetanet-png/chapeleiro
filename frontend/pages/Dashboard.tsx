@@ -1,6 +1,8 @@
+
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, ExternalLink, Activity, Database, Clock, MoreVertical, Terminal, Loader2, Server, Key, Shield, Trash2, AlertTriangle } from 'lucide-react';
+import { Plus, Search, ExternalLink, Activity, Database, Clock, MoreVertical, Terminal, Loader2, Server, Key, Shield, Trash2, AlertTriangle, Cpu, HardDrive } from 'lucide-react';
 import { Project } from '../types';
+import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 
 interface DashboardProps {
   onSelectProject: (id: string) => void;
@@ -12,11 +14,15 @@ const Dashboard: React.FC<DashboardProps> = ({ onSelectProject }) => {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newProject, setNewProject] = useState({ name: '', slug: '' });
   const [deletingProject, setDeletingProject] = useState<string | null>(null);
+  
+  // System Stats
+  const [systemUsage, setSystemUsage] = useState<any>(null);
 
   const fetchProjects = async () => {
     try {
+      const token = localStorage.getItem('cascata_token');
       const response = await fetch('/api/control/projects', {
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
+        headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await response.json();
       setProjects(data);
@@ -27,7 +33,22 @@ const Dashboard: React.FC<DashboardProps> = ({ onSelectProject }) => {
     }
   };
 
-  useEffect(() => { fetchProjects(); }, []);
+  const fetchSystemStats = async () => {
+      try {
+          const res = await fetch('/api/control/system/usage', {
+              headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
+          });
+          const data = await res.json();
+          setSystemUsage(data);
+      } catch (e) {}
+  };
+
+  useEffect(() => { 
+      fetchProjects(); 
+      fetchSystemStats();
+      const interval = setInterval(fetchSystemStats, 5000);
+      return () => clearInterval(interval);
+  }, []);
 
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -69,9 +90,16 @@ const Dashboard: React.FC<DashboardProps> = ({ onSelectProject }) => {
     }
   };
 
+  // Pie Data for Memory
+  const memData = systemUsage ? [
+      { name: 'Used', value: systemUsage.memory.used },
+      { name: 'Free', value: systemUsage.memory.free }
+  ] : [];
+  const MEM_COLORS = ['#4f46e5', '#e2e8f0'];
+
   return (
     <div className="p-12 lg:p-20 max-w-7xl mx-auto w-full min-h-screen">
-      <div className="flex flex-col md:flex-row md:items-end justify-between mb-20 gap-8">
+      <div className="flex flex-col md:flex-row md:items-end justify-between mb-12 gap-8">
         <div>
           <h1 className="text-6xl font-black text-slate-900 tracking-tighter mb-4">Registry</h1>
           <p className="text-slate-400 text-xl font-medium max-w-2xl leading-relaxed">Infrastructure-as-a-Code orchestration for multi-tenant PostgreSQL environments.</p>
@@ -83,6 +111,52 @@ const Dashboard: React.FC<DashboardProps> = ({ onSelectProject }) => {
           <Plus size={28} /> Provision Instance
         </button>
       </div>
+
+      {/* SYSTEM HEALTH MONITOR */}
+      {systemUsage && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-20">
+              <div className="bg-white border border-slate-200 rounded-[2.5rem] p-8 flex items-center gap-8 shadow-sm">
+                  <div className="h-32 w-32 relative flex items-center justify-center">
+                      <ResponsiveContainer width="100%" height="100%">
+                          <PieChart>
+                              <Pie data={memData} innerRadius={35} outerRadius={50} dataKey="value" stroke="none">
+                                  {memData.map((entry, index) => (
+                                      <Cell key={`cell-${index}`} fill={MEM_COLORS[index % MEM_COLORS.length]} />
+                                  ))}
+                              </Pie>
+                          </PieChart>
+                      </ResponsiveContainer>
+                      <div className="absolute inset-0 flex items-center justify-center flex-col">
+                          <span className="text-[10px] font-black text-slate-400 uppercase">RAM</span>
+                          <span className="text-sm font-bold text-indigo-600">{Math.round(systemUsage.memory.percent)}%</span>
+                      </div>
+                  </div>
+                  <div>
+                      <h4 className="text-xl font-black text-slate-900 flex items-center gap-2"><HardDrive size={20} className="text-indigo-600"/> Memory Load</h4>
+                      <p className="text-xs text-slate-500 font-bold mt-1">
+                          Using {(systemUsage.memory.used / 1024 / 1024 / 1024).toFixed(1)} GB of {(systemUsage.memory.total / 1024 / 1024 / 1024).toFixed(1)} GB total available.
+                      </p>
+                  </div>
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-[2.5rem] p-8 flex items-center gap-8 shadow-sm">
+                  <div className="h-32 w-32 bg-slate-50 rounded-full flex items-center justify-center relative overflow-hidden">
+                      <div className="absolute bottom-0 left-0 right-0 bg-emerald-500 transition-all duration-1000" style={{ height: `${systemUsage.cpu.usage_percent}%` }}></div>
+                      <div className="relative z-10 flex flex-col items-center">
+                          <Cpu size={24} className="text-slate-900 mb-1"/>
+                          <span className="text-sm font-bold text-slate-900">{systemUsage.cpu.usage_percent.toFixed(0)}%</span>
+                      </div>
+                  </div>
+                  <div>
+                      <h4 className="text-xl font-black text-slate-900 flex items-center gap-2"><Cpu size={20} className="text-emerald-600"/> CPU Load</h4>
+                      <p className="text-xs text-slate-500 font-bold mt-1">
+                          {systemUsage.cpu.model} <br/>
+                          {systemUsage.cpu.cores} Cores Active • Uptime: {(systemUsage.uptime / 3600).toFixed(1)}h
+                      </p>
+                  </div>
+              </div>
+          </div>
+      )}
 
       {loading && projects.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-40 text-slate-400">
@@ -117,7 +191,7 @@ const Dashboard: React.FC<DashboardProps> = ({ onSelectProject }) => {
         </div>
       )}
 
-      {/* Provisioning Modal (Robust) */}
+      {/* Provisioning Modal */}
       {showCreateModal && (
         <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-2xl z-[100] flex items-center justify-center p-8 animate-in fade-in duration-500">
           <div className="bg-white rounded-[4rem] w-full max-w-xl p-16 shadow-[0_0_150px_rgba(0,0,0,0.5)] border border-slate-100 animate-in zoom-in-95">

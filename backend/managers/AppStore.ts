@@ -101,13 +101,13 @@ export class AppStore {
 
         // C. Substituir Variáveis no Template
         const networkName = await this.getDockerNetworkName();
-        const containerPrefix = `app-${shortId}`; // Nome curto para evitar limites do Docker DNS
+        const containerPrefix = `app-${shortId}`; 
         
         let finalCompose = composeTemplate
             .replace(/\${CONTAINER_PREFIX}/g, containerPrefix)
             .replace(/\${DOMAIN}/g, domain)
             .replace(/\${NETWORK_NAME}/g, networkName)
-            .replace(/\${DB_HOST}/g, 'cascata-db') // Conecta no container do banco principal via rede interna
+            .replace(/\${DB_HOST}/g, 'cascata-db') 
             .replace(/\${DB_NAME}/g, dbName)
             .replace(/\${DB_USER}/g, dbUser)
             .replace(/\${DB_PASS}/g, dbPass)
@@ -125,7 +125,7 @@ export class AppStore {
             DB_NAME: dbName,
             DB_USER: dbUser,
             DB_HOST: 'cascata-db',
-            N8N_ENCRYPTION_KEY: encryptionKey, // Crítico para backup do usuário
+            N8N_ENCRYPTION_KEY: encryptionKey, 
             INSTALL_DATE: new Date().toISOString()
         };
 
@@ -165,9 +165,7 @@ export class AppStore {
 
     public async deleteApp(appId: string) {
         await this.stopApp(appId);
-        // Soft delete do registro, mantemos o banco de dados por segurança (usuário remove manualmente se quiser)
         await this.systemPool.query(`DELETE FROM system.apps WHERE id = $1`, [appId]);
-        
         const appDir = path.join(APPS_ROOT, appId);
         if (fs.existsSync(appDir)) {
             fs.rmSync(appDir, { recursive: true, force: true });
