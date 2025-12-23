@@ -23,45 +23,58 @@ export class AppStore {
         if (!fs.existsSync(APPS_ROOT)) fs.mkdirSync(APPS_ROOT, { recursive: true });
     }
 
-    // --- 1. LISTAGEM (GITHUB SOURCE OF TRUTH) ---
+    // --- 1. LISTAGEM (ONLINE ONLY - SECURITY ENFORCED) ---
     public async fetchStoreListing() {
+        // Removido fallback local inseguro. Se não conectar, falha explicitamente.
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
+        
         try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 8000);
-            
             const res = await fetch(`${GITHUB_REPO_BASE}/apps.json`, { signal: controller.signal });
             clearTimeout(timeout);
             
-            if (!res.ok) throw new Error("Repositório inacessível");
+            if (!res.ok) throw new Error(`Falha ao contactar App Store (HTTP ${res.status})`);
             return await res.json();
-        } catch (e) {
-            console.warn("[AppStore] GitHub fetch failed, using offline fallback:", e);
-            return [
-                {
-                    id: "n8n",
-                    name: "n8n Workflow Automation",
-                    description: "Ferramenta de automação de fluxo de trabalho líder de mercado. (Modo Offline)",
-                    logo: "https://raw.githubusercontent.com/n8n-io/n8n/master/assets/n8n-logo.png",
-                    version: "latest",
-                    tags: ["Automation", "Low-code", "Official"]
-                }
-            ];
+        } catch (e: any) {
+            clearTimeout(timeout);
+            console.error("[AppStore] Fetch error:", e.message);
+            throw new Error("Não foi possível carregar o catálogo de apps. Verifique sua conexão com a internet.");
         }
     }
 
-    // --- 2. INSTALAÇÃO (SYSTEM DB SHARING) ---
+    // --- 2. INSTALAÇÃO (VALIDATED) ---
     public async installApp(projectSlug: string, appId: string, domain: string) {
-        console.log(`[AppStore] Installing ${appId} for ${projectSlug} on ${domain}...`);
+        // 1. Validação de Duplicidade de Domínio
+        const cleanDomain = domain.trim().toLowerCase();
+        const check = await this.systemPool.query(
+            `SELECT id FROM system.apps WHERE domain = $1`, 
+            [cleanDomain]
+        );
+        
+        if (check.rowCount && check.rowCount > 0) {
+            throw new Error(`O domínio '${cleanDomain}' já está em uso por outra aplicação.`);
+        }
+
+        // 2. Validação de Conflito com Projetos
+        const checkProj = await this.systemPool.query(
+            `SELECT id FROM system.projects WHERE custom_domain = $1`, 
+            [cleanDomain]
+        );
+        if (checkProj.rowCount && checkProj.rowCount > 0) {
+            throw new Error(`O domínio '${cleanDomain}' já está em uso por um Projeto.`);
+        }
+
+        console.log(`[AppStore] Installing ${appId} for ${projectSlug} on ${cleanDomain}...`);
 
         const deployId = crypto.randomUUID();
         const shortId = deployId.split('-')[0];
         
-        // Configuração de Banco de Dados ISOLADO LÓGICAMENTE no Postgres do Sistema
+        // Configuração de Banco de Dados
         const dbName = `app_${projectSlug.replace(/-/g,'_')}_${appId}_${shortId}`.toLowerCase();
         const dbUser = `u_${shortId}`;
         const dbPass = crypto.randomBytes(16).toString('hex');
         
-        // Credenciais Específicas do n8n (Geradas automaticamente)
+        // Credenciais
         const encryptionKey = crypto.randomBytes(32).toString('base64'); 
         const runnerSecret = crypto.randomBytes(32).toString('base64');
         const jwtSecret = crypto.randomBytes(32).toString('hex');
@@ -69,14 +82,11 @@ export class AppStore {
         // A. Provisionar Banco de Dados
         const client = await this.systemPool.connect();
         try {
-            // Verifica se usuário existe
             const userCheck = await client.query(`SELECT 1 FROM pg_roles WHERE rolname=$1`, [dbUser]);
             if (userCheck.rowCount === 0) {
                 await client.query(`CREATE USER "${dbUser}" WITH PASSWORD '${dbPass}'`);
             }
-            // Cria o banco
             await client.query(`CREATE DATABASE "${dbName}" OWNER "${dbUser}"`);
-            console.log(`[AppStore] DB ${dbName} criado.`);
         } catch (e: any) {
             client.release();
             throw new Error(`Falha ao provisionar banco: ${e.message}`);
@@ -84,28 +94,26 @@ export class AppStore {
             client.release();
         }
 
-        // B. Obter Template Docker Compose
+        // B. Obter Template Docker Compose (ONLINE ONLY)
         let composeTemplate = '';
         try {
             const res = await fetch(`${GITHUB_REPO_BASE}/${appId}/docker-compose.yml`);
             if (res.ok) {
                 composeTemplate = await res.text();
             } else {
-                throw new Error("Template remoto não encontrado");
+                throw new Error("Template docker-compose.yml não encontrado no repositório.");
             }
-        } catch (e) {
-            console.log("[AppStore] Using local fallback template for n8n");
-            if (appId === 'n8n') composeTemplate = this.getN8nFallbackTemplate();
-            else throw new Error("App não suportado no modo fallback.");
+        } catch (e: any) {
+            throw new Error(`Erro ao baixar template: ${e.message}`);
         }
 
-        // C. Substituir Variáveis no Template
+        // C. Substituir Variáveis
         const networkName = await this.getDockerNetworkName();
-        const containerPrefix = `app-${shortId}`; 
+        const containerPrefix = `app-${shortId}`;
         
         let finalCompose = composeTemplate
             .replace(/\${CONTAINER_PREFIX}/g, containerPrefix)
-            .replace(/\${DOMAIN}/g, domain)
+            .replace(/\${DOMAIN}/g, cleanDomain)
             .replace(/\${NETWORK_NAME}/g, networkName)
             .replace(/\${DB_HOST}/g, 'cascata-db') 
             .replace(/\${DB_NAME}/g, dbName)
@@ -120,7 +128,7 @@ export class AppStore {
         if (!fs.existsSync(appDir)) fs.mkdirSync(appDir, { recursive: true });
         fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), finalCompose);
         
-        // E. Registrar no Banco do Sistema
+        // E. Registrar no Banco
         const envVars = {
             DB_NAME: dbName,
             DB_USER: dbUser,
@@ -132,7 +140,7 @@ export class AppStore {
         await this.systemPool.query(
             `INSERT INTO system.apps (id, project_slug, type, domain, port_internal, container_name_main, env_vars, status) 
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'provisioning')`,
-            [deployId, projectSlug, appId, domain, 5678, `${containerPrefix}-main`, JSON.stringify(envVars)]
+            [deployId, projectSlug, appId, cleanDomain, 5678, `${containerPrefix}-main`, JSON.stringify(envVars)]
         );
 
         // F. Executar Deploy
@@ -150,7 +158,11 @@ export class AppStore {
     public async stopApp(appId: string) {
         const appDir = path.join(APPS_ROOT, appId);
         if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
-            await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} down`);
+            try {
+                await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} down`);
+            } catch (e) {
+                console.warn(`[AppStore] Warning on stop: ${e}`);
+            }
         }
         await this.systemPool.query(`UPDATE system.apps SET status = 'stopped' WHERE id = $1`, [appId]);
     }
@@ -159,16 +171,50 @@ export class AppStore {
         const appDir = path.join(APPS_ROOT, appId);
         if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
             await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} up -d`);
+        } else {
+            throw new Error("Arquivos da aplicação não encontrados.");
         }
         await this.systemPool.query(`UPDATE system.apps SET status = 'running' WHERE id = $1`, [appId]);
     }
 
+    // --- ROBUST DELETE (FIXES 500 ERROR) ---
     public async deleteApp(appId: string) {
-        await this.stopApp(appId);
-        await this.systemPool.query(`DELETE FROM system.apps WHERE id = $1`, [appId]);
+        console.log(`[AppStore] Deleting app ${appId}...`);
         const appDir = path.join(APPS_ROOT, appId);
+        
+        // 1. Tentar derrubar containers (ignora erro se já não existirem)
+        if (fs.existsSync(path.join(appDir, 'docker-compose.yml'))) {
+            try {
+                await execAsync(`docker compose -f ${path.join(appDir, 'docker-compose.yml')} down -v`);
+            } catch (e: any) {
+                console.warn(`[AppStore] Docker down failed (ignoring cleanup): ${e.message}`);
+            }
+        }
+
+        // 2. Tentar remover banco de dados (Best Effort)
+        try {
+            const res = await this.systemPool.query(`SELECT env_vars FROM system.apps WHERE id = $1`, [appId]);
+            if (res.rows.length > 0) {
+                const env = res.rows[0].env_vars;
+                if (env && env.DB_NAME) {
+                    await this.systemPool.query(`DROP DATABASE IF EXISTS "${env.DB_NAME}"`);
+                    await this.systemPool.query(`DROP USER IF EXISTS "${env.DB_USER}"`);
+                }
+            }
+        } catch (e) {
+            console.warn(`[AppStore] DB Cleanup failed:`, e);
+        }
+
+        // 3. Remover registro do banco (CRÍTICO: Isso previne o erro 500 de persistir)
+        await this.systemPool.query(`DELETE FROM system.apps WHERE id = $1`, [appId]);
+        
+        // 4. Remover arquivos
         if (fs.existsSync(appDir)) {
-            fs.rmSync(appDir, { recursive: true, force: true });
+            try {
+                fs.rmSync(appDir, { recursive: true, force: true });
+            } catch (e) {
+                console.warn(`[AppStore] File cleanup failed:`, e);
+            }
         }
     }
 
@@ -192,43 +238,5 @@ export class AppStore {
         } catch (e) {
             return 'default';
         }
-    }
-
-    private getN8nFallbackTemplate() {
-        return `
-services:
-  n8n:
-    image: n8nio/n8n:latest
-    restart: unless-stopped
-    container_name: \${CONTAINER_PREFIX}-main
-    networks:
-      - default
-      - cascata_net
-    environment:
-      - NODE_ENV=production
-      - N8N_HOST=\${DOMAIN}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=\${DB_HOST}
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_USER=\${DB_USER}
-      - DB_POSTGRESDB_PASSWORD=\${DB_PASS}
-      - DB_POSTGRESDB_DATABASE=\${DB_NAME}
-      - N8N_ENCRYPTION_KEY=\${ENCRYPTION_KEY}
-      - N8N_USER_MANAGEMENT_JWT_SECRET=\${JWT_SECRET}
-      - WEBHOOK_URL=https://\${DOMAIN}/
-      - N8N_PROXY_HOPS=1
-      - GENERIC_TIMEZONE=America/Sao_Paulo
-    volumes:
-      - ./n8n_data:/home/node/.n8n
-
-networks:
-  cascata_net:
-    internal: true
-  default:
-    name: \${NETWORK_NAME}
-    external: true
-`;
     }
 }

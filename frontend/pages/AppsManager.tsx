@@ -3,7 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { 
   AppWindow, Plus, Play, Square, Trash2, ExternalLink, 
   Terminal, Globe, Loader2, CheckCircle2, AlertCircle, 
-  Settings, X, CloudLightning, Download, ShoppingBag, Server
+  Settings, X, CloudLightning, Download, ShoppingBag, Server, AlertTriangle
 } from 'lucide-react';
 
 const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
@@ -19,11 +19,25 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
   // STORE STATE
   const [storeApps, setStoreApps] = useState<any[]>([]);
   const [loadingStore, setLoadingStore] = useState(false);
-  const [installModal, setInstallModal] = useState<any>(null); // App being installed
-  const [installConfig, setInstallConfig] = useState({ domain: '' });
+  const [storeError, setStoreError] = useState('');
+  
+  // INSTALLATION STATE
+  const [installModal, setInstallModal] = useState<any>(null);
+  const [subdomain, setSubdomain] = useState('');
+  const [systemDomain, setSystemDomain] = useState('');
   const [installing, setInstalling] = useState(false);
 
   // FETCHERS
+  const fetchSystemConfig = async () => {
+      try {
+          const res = await fetch('/api/control/system/settings', {
+              headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
+          });
+          const data = await res.json();
+          if (data.domain) setSystemDomain(data.domain);
+      } catch (e) { console.error("Falha ao carregar config do sistema"); }
+  };
+
   const fetchInstalledApps = async () => {
     setLoading(true);
     try {
@@ -37,26 +51,38 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
 
   const fetchStore = async () => {
     setLoadingStore(true);
+    setStoreError('');
     try {
       const res = await fetch(`/api/control/store/apps`, {
         headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
       });
+      if (!res.ok) throw new Error((await res.json()).error);
       setStoreApps(await res.json());
-    } catch (e) { console.error(e); }
+    } catch (e: any) { 
+        setStoreError(e.message);
+    }
     finally { setLoadingStore(false); }
   };
 
   useEffect(() => { 
+      fetchSystemConfig();
       if (activeTab === 'installed') fetchInstalledApps();
       if (activeTab === 'store') fetchStore();
   }, [projectId, activeTab]);
 
   // ACTIONS
   const handleInstall = async () => {
-    if (!installConfig.domain) return;
+    // Constrói o domínio final
+    const finalDomain = systemDomain ? `${subdomain}.${systemDomain}` : subdomain;
+    
+    if (!finalDomain) {
+        alert("Domínio inválido.");
+        return;
+    }
+
     setInstalling(true);
     try {
-      await fetch(`/api/control/projects/${projectId}/apps/install`, {
+      const res = await fetch(`/api/control/projects/${projectId}/apps/install`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -64,14 +90,21 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
         },
         body: JSON.stringify({ 
             appId: installModal.id, 
-            domain: installConfig.domain 
+            domain: finalDomain
         })
       });
+      
+      if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || "Erro na instalação");
+      }
+
       setInstallModal(null);
-      setInstallConfig({ domain: '' });
+      setSubdomain('');
       setActiveTab('installed');
-    } catch (e) {
-      alert("Falha no deploy. Verifique se o domínio é válido e aponte para este servidor.");
+      fetchInstalledApps(); // Refresh imediato
+    } catch (e: any) {
+      alert(`Falha no deploy: ${e.message}`);
     } finally {
       setInstalling(false);
     }
@@ -87,12 +120,17 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
   };
 
   const handleDelete = async (id: string) => {
-    if(!confirm("Excluir este app permanentemente? Os dados no banco serão mantidos por segurança, mas o container será removido.")) return;
-    await fetch(`/api/control/projects/${projectId}/apps/${id}`, {
-        method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
-    });
-    fetchInstalledApps();
+    if(!confirm("Excluir este app permanentemente? Os dados no banco serão apagados.")) return;
+    try {
+        const res = await fetch(`/api/control/projects/${projectId}/apps/${id}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('cascata_token')}` }
+        });
+        if (!res.ok) throw new Error("Erro ao excluir");
+        fetchInstalledApps();
+    } catch(e) {
+        alert("Erro ao excluir aplicação. Verifique os logs.");
+    }
   };
 
   const fetchLogs = async (appId: string) => {
@@ -175,6 +213,12 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
       {activeTab === 'store' && (
           loadingStore ? (
             <div className="py-40 flex justify-center"><Loader2 className="animate-spin text-indigo-600" size={40}/></div>
+          ) : storeError ? (
+            <div className="py-20 flex flex-col items-center justify-center text-rose-400 gap-4">
+                <AlertTriangle size={48}/>
+                <p className="font-bold text-sm text-center max-w-md">{storeError}</p>
+                <button onClick={fetchStore} className="px-6 py-2 bg-rose-50 text-rose-600 rounded-xl text-xs font-black uppercase hover:bg-rose-100">Tentar Novamente</button>
+            </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
                 {storeApps.map(item => (
@@ -193,7 +237,7 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
                         </div>
 
                         <button 
-                            onClick={() => setInstallModal(item)}
+                            onClick={() => { setInstallModal(item); setSubdomain(item.id); }}
                             className="w-full bg-slate-900 text-white py-4 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-indigo-600 transition-all shadow-xl group-hover:shadow-indigo-200 flex items-center justify-center gap-2"
                         >
                             <Download size={14}/> Instalar
@@ -213,18 +257,42 @@ const AppsManager: React.FC<{ projectId: string }> = ({ projectId }) => {
               
               <div className="space-y-6">
                  <div className="space-y-2">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Subdomínio da Aplicação</label>
-                    <input 
-                      autoFocus
-                      value={installConfig.domain}
-                      onChange={(e) => setInstallConfig({...installConfig, domain: e.target.value})}
-                      placeholder={`app.${window.location.hostname}`}
-                      className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 px-6 text-lg font-bold text-slate-900 outline-none focus:ring-4 focus:ring-indigo-500/10"
-                    />
-                    <p className="text-[10px] text-slate-400 font-bold px-2">O banco de dados será criado isoladamente como <code>app_{projectId}_{installModal.id}_...</code></p>
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">URL da Aplicação</label>
+                    
+                    {systemDomain ? (
+                        // MODO FÁCIL: Subdomínio
+                        <div className="flex items-center bg-slate-50 border border-slate-200 rounded-2xl overflow-hidden focus-within:ring-4 focus-within:ring-indigo-500/10">
+                            <input 
+                                autoFocus
+                                value={subdomain}
+                                onChange={(e) => setSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                                placeholder="app-name"
+                                className="flex-1 bg-transparent py-4 pl-6 text-lg font-bold text-slate-900 outline-none text-right"
+                            />
+                            <div className="bg-slate-100 py-4 pr-6 pl-2 text-slate-500 font-bold text-sm border-l border-slate-200">
+                                .{systemDomain}
+                            </div>
+                        </div>
+                    ) : (
+                        // MODO MANUAL: Domínio completo (Fallback)
+                        <input 
+                            autoFocus
+                            value={subdomain}
+                            onChange={(e) => setSubdomain(e.target.value)}
+                            placeholder="app.meudominio.com"
+                            className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 px-6 text-lg font-bold text-slate-900 outline-none focus:ring-4 focus:ring-indigo-500/10"
+                        />
+                    )}
+
+                    {!systemDomain && (
+                        <div className="flex gap-2 items-center text-amber-600 bg-amber-50 p-3 rounded-xl mt-2">
+                            <AlertTriangle size={14}/>
+                            <p className="text-[10px] font-bold">Nenhum domínio base configurado em 'System Settings'. Digite o domínio completo.</p>
+                        </div>
+                    )}
                  </div>
                  
-                 <button onClick={handleInstall} disabled={installing || !installConfig.domain} className="w-full bg-indigo-600 text-white py-5 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl flex items-center justify-center gap-3 hover:bg-indigo-700 transition-all disabled:opacity-50">
+                 <button onClick={handleInstall} disabled={installing || !subdomain} className="w-full bg-indigo-600 text-white py-5 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl flex items-center justify-center gap-3 hover:bg-indigo-700 transition-all disabled:opacity-50">
                     {installing ? <Loader2 className="animate-spin" size={18}/> : 'Iniciar Instalação'}
                  </button>
                  <button onClick={() => setInstallModal(null)} className="w-full py-4 text-xs font-bold text-slate-400 hover:text-slate-600">Cancelar</button>
