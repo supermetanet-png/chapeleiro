@@ -10,6 +10,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
+import { AppStore } from './managers/AppStore.js'; // INTEGRACAO APP STORE
 
 dotenv.config();
 
@@ -40,12 +41,14 @@ const PORT = process.env.PORT || 3000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const STORAGE_ROOT = path.resolve(__dirname, '../storage');
+const APPS_ROOT = path.resolve(__dirname, '../storage/apps'); // NOVO PATH
 const MIGRATIONS_ROOT = path.resolve(__dirname, '../migrations');
 const NGINX_DYNAMIC_ROOT = '/etc/nginx/conf.d/dynamic';
 
 // Ensure directories exist immediately
 try {
   if (!fs.existsSync(STORAGE_ROOT)) fs.mkdirSync(STORAGE_ROOT, { recursive: true });
+  if (!fs.existsSync(APPS_ROOT)) fs.mkdirSync(APPS_ROOT, { recursive: true }); // NOVO
   if (!fs.existsSync(NGINX_DYNAMIC_ROOT)) fs.mkdirSync(NGINX_DYNAMIC_ROOT, { recursive: true });
 } catch (e) { console.error('[System] Root dir create error:', e); }
 
@@ -59,7 +62,10 @@ const systemPool = new Pool({
   idleTimeoutMillis: 30000 
 });
 
-// --- INTEGRATED CERTIFICATE MANAGER (Updated for SNI & Sync & RELOAD) ---
+// Inicializa AppStore
+const appStore = new AppStore(systemPool); // NOVO
+
+// --- INTEGRATED CERTIFICATE MANAGER (Updated for SNI & Sync & RELOAD & APPS) ---
 export type CertProvider = 'traefik' | 'certbot' | 'manual' | 'none';
 
 class CertificateManager {
@@ -122,7 +128,7 @@ class CertificateManager {
       }
   }
 
-  // Gera arquivos de configuração do Nginx para cada projeto
+  // Gera arquivos de configuração do Nginx para cada projeto E CADA APP
   public static async rebuildNginxConfigs() {
     console.log('[CertManager] Rebuilding Nginx dynamic configurations...');
     try {
@@ -134,32 +140,26 @@ class CertificateManager {
         if (file.endsWith('.conf')) fs.unlinkSync(path.join(NGINX_DYNAMIC_ROOT, file));
       }
 
+      // 1. PROJECTS
       const result = await systemPool.query('SELECT slug, custom_domain, ssl_certificate_source FROM system.projects WHERE custom_domain IS NOT NULL');
       
       let generatedCount = 0;
       for (const proj of result.rows) {
         if (!proj.custom_domain) continue;
 
-        // Determina qual certificado usar (Próprio ou Compartilhado/Linkado)
         const certDomain = proj.ssl_certificate_source || proj.custom_domain;
         const certPath = path.join(this.basePath, certDomain);
         
-        // Verifica se os arquivos de certificado realmente existem
         if (fs.existsSync(path.join(certPath, 'fullchain.pem')) && fs.existsSync(path.join(certPath, 'privkey.pem'))) {
-          // Usamos o container_name fixo 'cascata-backend-data' para o proxy pass
           const configContent = `
 server {
     listen 443 ssl;
     server_name ${proj.custom_domain};
-    
     ssl_certificate /etc/letsencrypt/live/${certDomain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${certDomain}/privkey.pem;
-    
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
-    
     client_max_body_size 100M;
-
     location / {
         proxy_pass http://cascata-backend-data:3000;
         proxy_set_header Host $host;
@@ -170,13 +170,42 @@ server {
 }`;
           fs.writeFileSync(path.join(NGINX_DYNAMIC_ROOT, `${proj.slug}.conf`), configContent.trim());
           generatedCount++;
-        } else {
-          console.warn(`[CertManager] Skipping config for ${proj.custom_domain}: Certificate for ${certDomain} not found.`);
         }
+      }
+
+      // 2. APPS (NOVO) - Loop para gerar configs dos Apps instalados
+      const apps = await systemPool.query("SELECT * FROM system.apps WHERE status = 'running'");
+      for (const app of apps.rows) {
+          const certPath = path.join(this.basePath, app.domain);
+          if (fs.existsSync(path.join(certPath, 'fullchain.pem'))) {
+              const appConfig = `
+server {
+    listen 443 ssl;
+    server_name ${app.domain};
+    ssl_certificate /etc/letsencrypt/live/${app.domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${app.domain}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    client_max_body_size 500M;
+    
+    location / {
+        proxy_pass http://${app.container_name_main}:${app.port_internal};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+    }
+}`;
+              fs.writeFileSync(path.join(NGINX_DYNAMIC_ROOT, `app_${app.id}.conf`), appConfig.trim());
+              generatedCount++;
+          }
       }
       
       console.log(`[CertManager] Generated ${generatedCount} config files.`);
-      // CRITICAL: Trigger Reload
       this.reloadNginx();
 
     } catch (e) {
@@ -188,12 +217,10 @@ server {
       const domainDir = path.join(this.basePath, domain);
       if (fs.existsSync(domainDir)) {
           fs.rmSync(domainDir, { recursive: true, force: true });
-          // Também remover do archive se existir para limpeza completa
           const archiveDir = path.join('/etc/letsencrypt/archive', domain);
           if (fs.existsSync(archiveDir)) {
               fs.rmSync(archiveDir, { recursive: true, force: true });
           }
-          // Remove config de renovação do certbot
           const renewalFile = path.join('/etc/letsencrypt/renewal', `${domain}.conf`);
           if (fs.existsSync(renewalFile)) fs.unlinkSync(renewalFile);
           
@@ -244,7 +271,6 @@ server {
         
         if (!fs.existsSync(this.basePath)) fs.mkdirSync(this.basePath, { recursive: true });
         
-        // CRITICAL FIX: Ensure the domain directory exists before writing
         if (!fs.existsSync(domainDir)) {
             console.log(`[CertManager] Creating directory for ${domain}`);
             fs.mkdirSync(domainDir, { recursive: true });
@@ -314,6 +340,22 @@ class MigrationRunner {
     try {
       client = await systemPool.connect();
       await client.query(`CREATE SCHEMA IF NOT EXISTS system`);
+      
+      // APPS TABLE (NOVO)
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS system.apps (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            project_slug TEXT NOT NULL,
+            type TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            port_internal INTEGER,
+            container_name_main TEXT,
+            env_vars JSONB DEFAULT '{}',
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
       await client.query(`
         CREATE TABLE IF NOT EXISTS system.migrations (
           id SERIAL PRIMARY KEY,
@@ -348,7 +390,6 @@ class MigrationRunner {
         }
       }
       
-      // Rebuild Nginx Configs after migrations (to sync old projects)
       await CertificateManager.rebuildNginxConfigs();
 
     } catch (e: any) {
@@ -728,7 +769,61 @@ app.use(cascataAuth as any);
 app.get('/', (req, res) => { res.send('Cascata Engine OK'); });
 app.get('/health', (req, res) => { res.json({ status: 'ok', time: new Date() }); });
 
-// ... (Control Plane Routes) ...
+// --- CONTROL PLANE: STORE & APPS (NEW) ---
+
+// 1. Get Store Listing
+app.get('/api/control/store/apps', async (req: any, res: any) => {
+    try {
+        const apps = await appStore.fetchStoreListing();
+        res.json(apps);
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// 2. Install App
+app.post('/api/control/projects/:slug/apps/install', async (req: any, res: any) => {
+    const { appId, domain } = req.body;
+    try {
+        const result = await appStore.installApp(req.params.slug, appId, domain);
+        await CertificateManager.rebuildNginxConfigs();
+        res.json(result);
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// 3. List Installed Apps
+app.get('/api/control/projects/:slug/apps', async (req: any, res: any) => {
+    try {
+        const result = await systemPool.query('SELECT * FROM system.apps WHERE project_slug = $1', [req.params.slug]);
+        res.json(result.rows);
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// 4. App Actions (Delete, Stop, Start, Logs)
+app.delete('/api/control/projects/:slug/apps/:id', async (req: any, res: any) => {
+    try {
+        await appStore.deleteApp(req.params.id);
+        await CertificateManager.rebuildNginxConfigs();
+        res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/control/projects/:slug/apps/:id/action', async (req: any, res: any) => {
+    const { action } = req.body;
+    try {
+        if (action === 'stop') await appStore.stopApp(req.params.id);
+        else if (action === 'start') await appStore.startApp(req.params.id);
+        await CertificateManager.rebuildNginxConfigs();
+        res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/control/projects/:slug/apps/:id/logs', async (req: any, res: any) => {
+    try {
+        const logs = await appStore.getLogs(req.params.id);
+        res.json({ logs });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// ... (Control Plane Routes - PRESERVED) ...
 app.post('/api/control/auth/login', async (req: any, res: any) => {
   const { email, password } = req.body;
   try {
@@ -916,6 +1011,7 @@ app.delete('/api/control/projects/:slug', async (req: any, res: any) => {
     await systemPool.query('DELETE FROM system.webhooks WHERE project_slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.api_logs WHERE project_slug = $1', [slug]);
     await systemPool.query('DELETE FROM system.ui_settings WHERE project_slug = $1', [slug]);
+    await systemPool.query('DELETE FROM system.apps WHERE project_slug = $1', [slug]); // DELETE APPS
 
     const storagePath = path.join(STORAGE_ROOT, slug);
     if (fs.existsSync(storagePath)) {
